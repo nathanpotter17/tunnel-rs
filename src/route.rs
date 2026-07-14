@@ -129,6 +129,13 @@ pub fn discover_uplink() -> Result<(Ipv4Addr, String, String)> {
     platform::uplink()
 }
 
+/// The TUN's platform interface id — name on Unix, ifindex on Windows, matching
+/// the EgressPin convention. The tripwire needs it to know which interface all
+/// public traffic must egress.
+pub fn interface_id(tun_name: &str, tun_ip: Ipv4Addr) -> Result<String> {
+    platform::iface_id(tun_name, tun_ip)
+}
+
 /// Pin DNS resolution for the tunnel interface to `server`, so lookups egress
 /// through the tunnel instead of leaking to a LAN resolver the exit can't reach.
 /// Scoped to the TUN interface (not global) — global resolver edits wouldn't

@@ -6,7 +6,7 @@
 //! Downstream data is serviced the moment it arrives — never parked on a timer.
 //! TUN egress is drained with an awaited send: lossless, backpressured.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,6 +155,48 @@ pub async fn run(settings: Settings, install_route: bool, shared: Arc<Shared>) -
     } else {
         warn!("Running WITHOUT --route: the default route is untouched, so no host \
                traffic is captured. Pass --route to tunnel all traffic.");
+        None
+    };
+
+    // TunnelVision (CVE-2024-3661) mitigation — packet-filter kill switch on the
+    // uplink. With the default route hijacked, a rogue DHCP option-121 route can
+    // steer app traffic straight out the uplink, bypassing the TUN; the
+    // encryption never sees it. Routing can't defend a routing attack, so we
+    // enforce the invariant one layer down: a filter that permits only our own
+    // (marked / app-scoped) sockets out the uplink and drops everything else.
+    // Armed only when we actually captured the route; fail-closed — if it can't
+    // arm we refuse to run rather than run leaky. Declared AFTER _route_guard so
+    // it drops FIRST on teardown (filter removed, then routes restored).
+    let _killswitch_guard = if _route_guard.is_some() {
+        match crate::killswitch::KillSwitch::install(&egress) {
+            Ok(ks) => {
+                info!("Kill switch armed — uplink egress restricted to the tunnel (TunnelVision mitigated)");
+                Some(ks)
+            }
+            Err(e) => {
+                bail!(
+                    "failed to arm kill switch ({e}); refusing to run with an \
+                     unprotected uplink (TunnelVision leak risk). Fix the cause, \
+                     or pass --no-route to run without capturing traffic."
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Event-driven snooper tripwire (tripwire.rs). Armed only under capture. On a
+    // confirmed injection it locks the network down (a reboot-clearable kernel
+    // block) and terminates — no recovery — so this guard's own Drop only runs on
+    // a clean exit.
+    #[cfg(unix)]
+    let tun_id = name.clone();
+    #[cfg(windows)]
+    let tun_id = route::interface_id(&name, settings.tun_ip).unwrap_or_default();
+    let _tripwire = if _killswitch_guard.is_some() {
+        Some(crate::tripwire::spawn(tun_id, shared.clone()))
+    } else {
+        let _ = tun_id;
         None
     };
 

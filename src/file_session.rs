@@ -221,6 +221,7 @@ async fn handshake(
     match role {
         Role::Connect { bind, peer, remote_public } => {
             let socket = UdpSocket::bind(bind).await.context("bind file socket")?;
+            crate::pin::mark_own(&socket).context("mark file socket")?;
             socket.connect(peer).await.context("connect file peer")?;
             shared.push_log("info", format!("dialing file peer {peer}"));
 
@@ -240,6 +241,7 @@ async fn handshake(
         }
         Role::Listen { bind } => {
             let socket = UdpSocket::bind(bind).await.context("bind file socket")?;
+            crate::pin::mark_own(&socket).context("mark file socket")?;
             shared.push_log("info", format!("file channel listening on {bind}"));
 
             let mut buf = vec![0u8; MAX_PACKET_SIZE];

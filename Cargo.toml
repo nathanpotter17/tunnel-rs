@@ -45,7 +45,20 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.4"
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+] }
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Rpc",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+] }
 
 [profile.release]
 lto = true

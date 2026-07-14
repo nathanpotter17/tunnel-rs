@@ -16,12 +16,14 @@ mod engine;
 mod file_session;
 mod file_transfer;
 mod inspect;
+mod killswitch;
 mod outbound;
 mod pin;
 mod protocol;
 mod route;
 mod settings;
 mod state;
+mod tripwire;
 mod tunio;
 mod wg;
 

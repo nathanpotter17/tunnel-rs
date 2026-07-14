@@ -23,6 +23,41 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
+/// Firewall mark stamped on every egress socket we own (the WireGuard/Direct
+/// exit sockets and the file channel). The kill switch (killswitch.rs) permits
+/// only marked traffic out the uplink and drops the rest — that drop is what
+/// closes the TunnelVision (CVE-2024-3661) leak, where a rogue DHCP option-121
+/// route would otherwise steer an app's flow straight out the uplink, bypassing
+/// the TUN. Value is arbitrary but must match the nftables rule.
+#[allow(dead_code)] // unix-only; Windows keys the kill switch on app id instead
+pub const EGRESS_FWMARK: u32 = 0x0000_7475;
+
+/// Tag a socket as our own egress. Unix: sets SO_MARK (read by nftables
+/// `meta mark`). Windows: no-op — the WFP kill switch permits by app id, so the
+/// whole process is already trusted and marks don't exist there.
+#[cfg(unix)]
+pub fn mark_own<S: std::os::unix::io::AsRawFd>(sock: &S) -> io::Result<()> {
+    let mark = EGRESS_FWMARK;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn mark_own<S>(_sock: &S) -> io::Result<()> {
+    Ok(())
+}
+
 /// Deadline for the outbound TCP handshake. On Windows a failed non-blocking
 /// connect signals the *except* set, which readiness APIs can surface late or
 /// never — without a deadline a dead destination wedges the flow task forever.
@@ -185,7 +220,9 @@ pub fn bind_to_interface(sock: &Socket, pin: &EgressPin, v4: bool) -> io::Result
 
 #[cfg(unix)]
 pub fn bind_to_interface(sock: &Socket, pin: &EgressPin, _v4: bool) -> io::Result<()> {
-    sock.bind_device(Some(pin.device.as_bytes()))
+    sock.bind_device(Some(pin.device.as_bytes()))?;
+    // Mark so the kill switch permits our own re-originated egress out the uplink.
+    mark_own(sock)
 }
 
 #[cfg(test)]
