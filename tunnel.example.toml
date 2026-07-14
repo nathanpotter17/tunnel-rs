@@ -1,0 +1,38 @@
+# tunnel settings. Copy to tunnel.toml (or pass with -c).
+# All fields are optional; the defaults below are built in.
+
+tun_ip = "198.18.0.1"   # our address on the TUN (RFC 2544 range, avoids LAN clashes)
+tun_prefix = 15
+mtu = 1400
+dns = "1.1.1.1"         # forced onto the TUN while full-tunnel is active, so DNS
+                        # travels through the tunnel (no leak). Set to Proton's DNS
+                        # or any public resolver reachable via your exit.
+
+# ---------------------------------------------------------------------------
+# Optional WireGuard exit (BYO VPN — e.g. ProtonVPN).
+#
+# When present, ALL tunneled traffic egresses through this WireGuard peer instead
+# of the host's uplink. This is how you get "Proton as the exit" WITHOUT running
+# the ProtonVPN app (whose kill switch would otherwise block us). Turn Proton's
+# app OFF and paste its WireGuard config values here.
+#
+# Get a config from Proton: Account → Downloads → WireGuard configuration.
+# Map the .conf fields:
+#   [Interface] PrivateKey  -> private_key
+#   [Interface] Address     -> address   (drop the "/32")
+#   [Peer]      PublicKey   -> public_key
+#   [Peer]      Endpoint    -> endpoint
+#   [Peer]      PresharedKey-> preshared_key (if present)
+# ---------------------------------------------------------------------------
+# [wireguard]
+# private_key = "AAAA...=="          # Interface.PrivateKey (base64)
+# public_key  = "BBBB...=="          # Peer.PublicKey (base64)
+# endpoint    = "203.0.113.10:51820" # Peer.Endpoint
+# address     = "10.2.0.2"           # Interface.Address without /32
+# preshared_key = "CCCC...=="        # optional
+# persistent_keepalive = 25
+
+# DNS: handled automatically. While full-tunnel is active the tool pins the TUN's
+# DNS to `dns` above (default 1.1.1.1) and prefers that interface, so lookups go
+# through the tunnel — no manual system-DNS change needed. Change `dns` if you
+# want a different resolver (must be reachable via your exit).
