@@ -21,7 +21,7 @@ use crate::conn::{self, ConnManager};
 use crate::device::TunDevice;
 use crate::inspect::{Direction, TrafficMonitor};
 use crate::outbound::{Direct, Outbound};
-use crate::pin::{self, EgressPin};
+use crate::pin::EgressPin;
 use crate::route::{self, FullTunnel};
 use crate::settings::Settings;
 use crate::state::Shared;
@@ -50,51 +50,20 @@ async fn flush_tun(
     true
 }
 
-pub async fn run(settings: Settings, install_route: bool, shared: Arc<Shared>) -> Result<()> {
+pub async fn run(
+    settings: Settings,
+    install_route: bool,
+    egress: EgressPin,
+    orig_gateway: String,
+    shared: Arc<Shared>,
+) -> Result<()> {
     let monitor = shared.monitor.clone();
 
-    // Discover the uplink BEFORE touching the routing table, from the OS's own
-    // forwarding decision (never a metric-sorted route listing — that once
-    // selected a defunct interface and every pinned connect died with
-    // 'unreachable host'). Then VERIFY the pin: a pinned connect toward the
-    // gateway must succeed now, or every outbound socket will fail the same
-    // way at runtime — better one loud line here than 200 dead flows later.
-    let (egress, orig_gateway) = match route::discover_uplink() {
-        Ok((src, iface_id, gw)) => {
-            let pin = EgressPin {
-                ifindex: iface_id.parse().unwrap_or(0),
-                device: iface_id,
-                src: Some(std::net::IpAddr::V4(src)),
-            };
-            info!("Uplink: src {}, iface {}, gateway {}", src, pin.device, gw);
-            let verified = gw
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("gateway '{gw}' is not an IPv4 address"),
-                    )
-                })
-                .and_then(|gw_ip| pin::probe_source_ip(gw_ip, &pin));
-            match verified {
-                Ok(_) => info!("Egress pin verified (pinned route to {} works)", gw),
-                Err(e) => warn!(
-                    "EGRESS PIN VERIFICATION FAILED ({e}): pinned outbound sockets will \
-                     likely fail with 'unreachable host' — iface {} may not be the \
-                     active uplink",
-                    pin.device
-                ),
-            }
-            (pin, gw)
-        }
-        Err(e) => {
-            warn!(
-                "Could not discover uplink ({e}); egress unpinned — outbound sockets \
-                 will follow the hijacked routing table and may loop"
-            );
-            (EgressPin { ifindex: 0, device: String::new(), src: None }, String::new())
-        }
-    };
+    // The uplink was discovered and the egress pin verified in `main` — once,
+    // before the route was hijacked — and handed in here, so the engine and the
+    // file channel share one source of truth. `egress` may be unpinned (and
+    // `orig_gateway` empty) if discovery failed; the fallbacks below still hold.
+
     // Choose the exit: a WireGuard peer (BYO, e.g. Proton) if configured, else
     // Direct out the host's uplink. Both pin egress to `egress`.
     let (outbound, exit_label): (Arc<dyn Outbound>, String) = match &settings.wireguard {

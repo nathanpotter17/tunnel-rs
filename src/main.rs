@@ -267,6 +267,11 @@ async fn main() -> Result<()> {
     }
     let settings = Settings::load_or_default(&settings_path)?;
 
+    // Discover the uplink and verify the egress pin ONCE, before anything can
+    // hijack the route, then hand the same pin to both the file channel and the
+    // engine so they cannot disagree on which uplink to leave from.
+    let (egress, orig_gateway) = pin::discover_egress();
+
     // File sharing runs ONLY with an [identity] in the settings file. Without
     // one the engine runs normally and the reason + fix are stated up front.
     let file_channel: Option<(file_session::FileHandle, tokio::task::JoinHandle<()>)> =
@@ -280,6 +285,8 @@ async fn main() -> Result<()> {
                     download_dir: file_transfer::FileTransferManager::default_download_dir(),
                     auto_accept: false,
                     approval_timeout: Some(Duration::from_secs(60)),
+                    // Clone of the single pin discovered above; the engine takes the original.
+                    pin: egress.clone(),
                 };
                 let role = match (command, connect_target.as_deref()) {
                     (Some("connect"), Some(target)) => {
@@ -333,7 +340,10 @@ async fn main() -> Result<()> {
     {
         let engine_shared = shared.clone();
         let engine = tokio::spawn(async move {
-            if let Err(e) = engine::run(settings, install_route, engine_shared.clone()).await {
+            if let Err(e) =
+                engine::run(settings, install_route, egress, orig_gateway, engine_shared.clone())
+                    .await
+            {
                 engine_shared.push_log("error", format!("engine: {e:#}"));
             }
         });
@@ -364,7 +374,7 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "gui"))]
     {
         let _ = files; // handle is GUI-only; headless has no dashboard
-        let res = engine::run(settings, install_route, shared.clone()).await;
+        let res = engine::run(settings, install_route, egress, orig_gateway, shared.clone()).await;
         shared.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(task) = file_task {
             let _ = task.await;

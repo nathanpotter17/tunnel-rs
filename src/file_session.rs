@@ -82,6 +82,9 @@ pub struct FileConfig {
     pub download_dir: PathBuf,
     pub auto_accept: bool,
     pub approval_timeout: Option<Duration>,
+    /// Egress pin captured pre-hijack, so the file socket leaves the real uplink
+    /// (direct P2P) instead of riding the engine's exit under full-tunnel.
+    pub pin: crate::pin::EgressPin,
 }
 
 /// Spawn the channel task; return the GUI handle plus the task's join handle so
@@ -110,7 +113,7 @@ async fn run(
     mut actions: mpsc::Receiver<FileAction>,
     view: Arc<Mutex<FileView>>,
 ) -> Result<()> {
-    let (socket, crypto) = handshake(&role, cfg.local_private, &shared).await?;
+    let (socket, crypto) = handshake(&role, cfg.local_private, &cfg.pin, &shared).await?;
     let peer = socket.peer_addr().ok();
     shared.push_log("info", format!("file channel established with {peer:?}"));
 
@@ -216,12 +219,16 @@ impl Channel {
 async fn handshake(
     role: &Role,
     local_private: [u8; 32],
+    pin: &crate::pin::EgressPin,
     shared: &Arc<Shared>,
 ) -> Result<(UdpSocket, CryptoSession)> {
     match role {
         Role::Connect { bind, peer, remote_public } => {
-            let socket = UdpSocket::bind(bind).await.context("bind file socket")?;
-            crate::pin::mark_own(&socket).context("mark file socket")?;
+            // `bind` port only; source/interface come from the egress pin so the
+            // socket egresses the real uplink, not the hijacked TUN route.
+            let socket = crate::pin::bind_udp_local(bind.port(), pin)
+                .await
+                .context("bind file socket")?;
             socket.connect(peer).await.context("connect file peer")?;
             shared.push_log("info", format!("dialing file peer {peer}"));
 
@@ -240,9 +247,17 @@ async fn handshake(
             Ok((socket, crypto))
         }
         Role::Listen { bind } => {
-            let socket = UdpSocket::bind(bind).await.context("bind file socket")?;
-            crate::pin::mark_own(&socket).context("mark file socket")?;
-            shared.push_log("info", format!("file channel listening on {bind}"));
+            let socket = crate::pin::bind_udp_local(bind.port(), pin)
+                .await
+                .context("bind file socket")?;
+            shared.push_log(
+                "info",
+                format!(
+                    "file channel listening on {}:{}",
+                    pin.src.map(|s| s.to_string()).unwrap_or_else(|| "0.0.0.0".into()),
+                    bind.port()
+                ),
+            );
 
             let mut buf = vec![0u8; MAX_PACKET_SIZE];
             let (n, from) = socket.recv_from(&mut buf).await.context("file accept")?;

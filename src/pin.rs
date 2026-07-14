@@ -127,6 +127,24 @@ pub async fn bind_udp(dst: SocketAddr, pin: &EgressPin) -> io::Result<UdpSocket>
     UdpSocket::from_std(std::net::UdpSocket::from(sock))
 }
 
+/// Bind a UDP socket to a FIXED local port on the pinned egress interface,
+/// sourced from the uplink's own address. `port == 0` → ephemeral. This is the
+/// file channel's bind: a listener must own its port on the real uplink IP, and
+/// replies must leave the uplink — not fall into a hijacked default route and
+/// ride the exit. The source-pin is what keeps the 5-tuple on the uplink; the
+/// mark (applied by bind_to_interface on unix) is what the kill switch permits.
+pub async fn bind_udp_local(port: u16, pin: &EgressPin) -> io::Result<UdpSocket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    bind_to_interface(&sock, pin, true)?; // interface pin (+ SO_MARK on unix)
+    let local = match pin.src {
+        Some(IpAddr::V4(v4)) => SocketAddr::new(IpAddr::V4(v4), port),
+        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), // degrade: iface-pin only
+    };
+    sock.bind(&local.into())?;
+    sock.set_nonblocking(true)?;
+    UdpSocket::from_std(std::net::UdpSocket::from(sock))
+}
+
 /// The source-address half of the pin (see module docs). IPv4 only, mirroring
 /// the engine's IPv4-only capture; a `None` source is a no-op (wildcard, as
 /// before — interface pin still applies).
@@ -155,6 +173,53 @@ pub fn probe_source_ip(probe: Ipv4Addr, pin: &EgressPin) -> io::Result<Ipv4Addr>
             io::ErrorKind::AddrNotAvailable,
             "OS selected no source address on the pinned interface",
         )),
+    }
+}
+
+/// Discover the host's uplink and build the egress pin ONCE, verifying it while
+/// the original route is still intact. Returns the pin plus the original default
+/// gateway (needed to keep the encrypted tunnel's own route reachable during a
+/// full-tunnel hijack). MUST run before the default route is hijacked. Never
+/// fails: a discovery error degrades to an unpinned egress (outbound sockets
+/// then follow the routing table) — logged loudly, the same fallback the engine
+/// used when this logic lived inline. Called once in `main` and shared by both
+/// the engine and the file channel, so they cannot disagree on the uplink.
+pub fn discover_egress() -> (EgressPin, String) {
+    match crate::route::discover_uplink() {
+        Ok((src, iface_id, gw)) => {
+            let pin = EgressPin {
+                ifindex: iface_id.parse().unwrap_or(0),
+                device: iface_id,
+                src: Some(IpAddr::V4(src)),
+            };
+            tracing::info!("Uplink: src {}, iface {}, gateway {}", src, pin.device, gw);
+            let verified = gw
+                .parse::<Ipv4Addr>()
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("gateway '{gw}' is not an IPv4 address"),
+                    )
+                })
+                .and_then(|gw_ip| probe_source_ip(gw_ip, &pin));
+            match verified {
+                Ok(_) => tracing::info!("Egress pin verified (pinned route to {} works)", gw),
+                Err(e) => tracing::warn!(
+                    "EGRESS PIN VERIFICATION FAILED ({e}): pinned outbound sockets will \
+                     likely fail with 'unreachable host' — iface {} may not be the \
+                     active uplink",
+                    pin.device
+                ),
+            }
+            (pin, gw)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not discover uplink ({e}); egress unpinned — outbound sockets \
+                 will follow the hijacked routing table and may loop"
+            );
+            (EgressPin { ifindex: 0, device: String::new(), src: None }, String::new())
+        }
     }
 }
 
