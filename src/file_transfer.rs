@@ -148,6 +148,76 @@ impl FileInfo {
     }
 }
 
+/// Reduce a fully-untrusted, peer-supplied file name to a safe bare filename, or
+/// fail closed. A received name arrives inside the encrypted frame but the PEER
+/// is not the local user: `download_dir.join(name)` with an absolute name
+/// (`/etc/cron.d/x`, `C:\Windows\...`) or a traversal (`../../.bashrc`) resolves
+/// OUTSIDE the download dir — arbitrary file write, i.e. trivial code execution.
+/// Rules are applied regardless of host OS so a sender can't target a peer on a
+/// different platform.
+fn sanitize_filename(raw: &str) -> Result<String> {
+    let name = raw.trim();
+
+    if name.is_empty() {
+        bail!("rejected file name: empty");
+    }
+    // No separators of ANY platform, no drive/ADS colon, no NUL, no other control
+    // chars, and no Unicode bidirectional-formatting chars — `char::is_control`
+    // is category Cc only and would miss these, yet they disguise a real
+    // extension (e.g. "invoice\u{202E}fdp.exe" renders as "invoiceexe.pdf").
+    fn is_bidi_control(c: char) -> bool {
+        matches!(c,
+            '\u{200E}' | '\u{200F}' | '\u{061C}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+        )
+    }
+    if name.contains(['/', '\\', ':', '\0'])
+        || name.chars().any(|c| c.is_control() || is_bidi_control(c))
+    {
+        bail!("rejected file name with path/control characters: {name:?}");
+    }
+    // Directory references, never real files.
+    if name == "." || name == ".." {
+        bail!("rejected file name: {name:?}");
+    }
+    // The OS must also agree this is exactly one component: `file_name()` returns
+    // None for `.`/`..`/roots and strips any directory part not already rejected.
+    let component = Path::new(name)
+        .file_name()
+        .and_then(|c| c.to_str())
+        .ok_or_else(|| anyhow::anyhow!("rejected file name: not a plain file: {name:?}"))?;
+    if component != name {
+        bail!("rejected file name: not a single path component: {name:?}");
+    }
+    // Windows strips trailing dots/spaces and reserves device names; an aliasing
+    // name can land unexpectedly. Reject on every platform.
+    if component.ends_with('.') || component.ends_with(' ') {
+        bail!("rejected file name with trailing dot/space: {name:?}");
+    }
+    let stem_upper = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem_upper.as_str()) {
+        bail!("rejected reserved device name: {name:?}");
+    }
+    if component.len() > 255 {
+        bail!("rejected file name: too long ({} bytes)", component.len());
+    }
+    Ok(component.to_string())
+}
+
+/// Hard ceiling on a single inbound transfer regardless of the peer's declared
+/// size. A policy constant, not a protocol limit: raise it for larger transfers.
+pub const MAX_INBOUND_FILE_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+
 // ============================================================================
 // Shared files registry
 // ============================================================================
@@ -431,12 +501,36 @@ pub struct FileReceiver {
 
 impl FileReceiver {
     pub fn new(name: String, size: u64, download_dir: &Path) -> Result<Self> {
-        let path = download_dir.join(&name);
+        // Choke point: last code before File::create. Re-validate here so no
+        // caller — present or future — can create a receiver that escapes
+        // download_dir, even if it skipped the sanitizer upstream.
+        let safe = sanitize_filename(&name)?;
+        let path = download_dir.join(&safe);
+
+        // Defense in depth (symlinked download dir / TOCTOU): the target's
+        // parent, canonicalized, must BE the canonical download dir. The dir
+        // exists (created in FileTransferManager::with_approval), so this
+        // succeeds; if it was removed mid-run we fail closed.
+        let canon_dir = fs::canonicalize(download_dir)
+            .with_context(|| format!("canonicalize download dir {}", download_dir.display()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("refusing write: target has no parent"))?;
+        let canon_parent = fs::canonicalize(parent)
+            .with_context(|| format!("canonicalize target parent {}", parent.display()))?;
+        if canon_parent != canon_dir {
+            bail!(
+                "refusing write outside download dir: {} resolves under {}",
+                path.display(),
+                canon_parent.display()
+            );
+        }
+
         let file = File::create(&path).context("Failed to create file")?;
 
         Ok(Self {
-            file_name: name,
-            file_size: size,
+            file_name: safe,
+            file_size: size.min(MAX_INBOUND_FILE_SIZE), // cap the peer's declared size
             transferred: 0,
             started_at: Instant::now(),
             file,
@@ -453,13 +547,19 @@ impl FileReceiver {
         }
 
         if chunk_num == self.expected_chunk {
-            self.file.write_all(data)?;
-            self.transferred += data.len() as u64;
+            // Never write past the declared length: a peer that streams beyond
+            // its own header cannot fill the disk.
+            let remaining = self.file_size.saturating_sub(self.transferred);
+            let take = (data.len() as u64).min(remaining) as usize;
+            self.file.write_all(&data[..take])?;
+            self.transferred += take as u64;
             self.expected_chunk += 1;
 
             while let Some(buffered_data) = self.buffered.remove(&self.expected_chunk) {
-                self.file.write_all(&buffered_data)?;
-                self.transferred += buffered_data.len() as u64;
+                let rem = self.file_size.saturating_sub(self.transferred);
+                let t = (buffered_data.len() as u64).min(rem) as usize;
+                self.file.write_all(&buffered_data[..t])?;
+                self.transferred += t as u64;
                 self.expected_chunk += 1;
             }
 
@@ -603,8 +703,11 @@ impl FileTransferManager {
     }
 
     pub fn create_list_response(&self, out: &mut [u8]) -> Result<usize> {
-        out[0] = FilePacketType::ListResponse as u8;
         let list_data = self.shared.encode_list()?;
+        if 1 + list_data.len() > out.len() {
+            bail!("shared file list too large for one datagram ({} bytes)", list_data.len());
+        }
+        out[0] = FilePacketType::ListResponse as u8;
         out[1..1 + list_data.len()].copy_from_slice(&list_data);
         Ok(1 + list_data.len())
     }
@@ -701,7 +804,8 @@ impl FileTransferManager {
                 let payload = request.header_payload
                     .context("Missing header payload for download approval")?;
                 let (info, _) = FileInfo::decode(&payload)?;
-                let unique_name = self.unique_filename(&info.name);
+                let safe = sanitize_filename(&info.name)?; // fail closed on a hostile name
+                let unique_name = self.unique_filename(&safe);
                 self.existing_downloads.insert(unique_name.clone());
 
                 self.receiving = Some(FileReceiver::new(
@@ -946,8 +1050,16 @@ impl FileTransferManager {
     fn handle_file_header(&mut self, payload: &[u8], out: &mut [u8]) -> Result<FileProcessResult> {
         let (info, _) = FileInfo::decode(payload)?;
 
+        // Fail closed on a hostile name before any state is created, and refuse
+        // an over-large transfer up front instead of mid-stream.
+        let safe = sanitize_filename(&info.name)?;
+        if info.size > MAX_INBOUND_FILE_SIZE {
+            let len = self.create_file_error("File exceeds size limit", out);
+            return Ok(FileProcessResult::SendResponse(len));
+        }
+
         if self.auto_accept {
-            let unique_name = self.unique_filename(&info.name);
+            let unique_name = self.unique_filename(&safe);
             self.existing_downloads.insert(unique_name.clone());
 
             self.receiving = Some(FileReceiver::new(
@@ -968,7 +1080,8 @@ impl FileTransferManager {
             self.pending_requests.push(PendingRequest {
                 id,
                 direction: TransferDirection::Download,
-                file_name: info.name.clone(),
+                // Display the sanitized name — the user approves exactly what lands.
+                file_name: safe,
                 file_size: info.size,
                 file_type: info.file_type.clone(),
                 requested_at: Instant::now(),
@@ -1091,6 +1204,56 @@ mod tests {
         assert_eq!(decoded.name, info.name);
         assert_eq!(decoded.size, info.size);
         assert_eq!(decoded.file_type, info.file_type);
+    }
+
+    #[test]
+    fn test_sanitize_filename_rejects_hostile_names() {
+        // Plain names pass through unchanged.
+        assert_eq!(sanitize_filename("report.pdf").unwrap(), "report.pdf");
+        assert_eq!(sanitize_filename("  spaced.txt  ").unwrap(), "spaced.txt");
+        assert_eq!(sanitize_filename(".bashrc").unwrap(), ".bashrc"); // hidden, but stays in dir
+
+        // Traversal / absolute / drive / ADS / device / control → rejected.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../evil",
+            "../../etc/passwd",
+            "/etc/cron.d/x",
+            "a/b",
+            "..\\..\\evil",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "file.txt:hidden",
+            "CON",
+            "com1.txt",
+            "nul",
+            "trailingdot.",
+            "trailing.dots..",
+            "bad\u{0000}name",
+            "bidi\u{202E}gpj.exe",
+        ] {
+            assert!(
+                sanitize_filename(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_receiver_refuses_traversal() {
+        let dir = tempdir().unwrap();
+        let dl_dir = dir.path().join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        // Absolute and traversal names must never create a receiver.
+        assert!(FileReceiver::new("../../escape".to_string(), 10, &dl_dir).is_err());
+        assert!(FileReceiver::new("/tmp/pwn".to_string(), 10, &dl_dir).is_err());
+
+        // A clean name lands inside the download dir.
+        let r = FileReceiver::new("ok.bin".to_string(), 10, &dl_dir).unwrap();
+        assert_eq!(r.path, dl_dir.join("ok.bin"));
+        assert!(dl_dir.join("ok.bin").exists());
     }
 
     #[test]
