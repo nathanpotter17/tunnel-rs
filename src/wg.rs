@@ -35,10 +35,26 @@ use crate::outbound::{Outbound, UdpConn};
 use crate::pin::{self, EgressPin};
 use crate::settings::WgSettings;
 
+/// Inner-stack TCP window for the WireGuard leg. Unlike the `Direct` exit — whose
+/// OS kernel socket the OS receive-window-autotunes — THIS smoltcp buffer *is* the
+/// WAN receive window for the encrypted path, so it is sized for the WAN
+/// bandwidth-delay product, NOT the ~0-RTT app leg. Do not shrink it to match
+/// conn.rs's app-leg window (`conn::APP_LEG_TCP_WINDOW`): that would cap
+/// single-stream throughput over WireGuard. See the sizing agreement below.
 const TCP_BUF: usize = 2 * 1024 * 1024;
 const UDP_PAYLOAD_BUF: usize = 64 * 1024;
 const UDP_META: usize = 32;
 const SCRATCH: usize = 65535;
+
+// Sizing agreement between the two legs of the split-TCP proxy. The app-leg
+// window (conn.rs) and this WAN-leg window are intentionally different sizes for
+// different hops; this check only pins their RELATIONSHIP — the WireGuard leg must
+// never be the smaller window, or it becomes the artificial single-stream
+// bottleneck. A future edit to either constant that inverts this fails to compile.
+const _: () = assert!(
+    TCP_BUF >= crate::conn::APP_LEG_TCP_WINDOW,
+    "wg.rs inner TCP window must be >= conn.rs app-leg window (APP_LEG_TCP_WINDOW)"
+);
 
 /// Inner-stack MTU. This is the MSS clamp: smoltcp derives the TCP MSS it
 /// advertises to the destination from this, so responses never exceed what fits

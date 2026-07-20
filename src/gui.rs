@@ -1178,15 +1178,29 @@ fn render_traffic(ui: &mut egui::Ui, traffic: &TrafficSnapshot, theme: &Theme) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let remote = truncate(&f.remote, 24);
-                    // Fade rows that have gone quiet.
-                    let base = if f.idle_ms > 5000 { theme.text_muted } else { theme.text_secondary };
+                    // Shed / reaped rows are deliberate admission-control actions,
+                    // not live conversations — render the whole row muted and swap
+                    // the rate cell for a status badge so they don't read as
+                    // anomalous up-only or half-open flows.
+                    let tagged = !f.status.is_empty();
+                    // Fade rows that have gone quiet, and tagged rows always.
+                    let base = if tagged || f.idle_ms > 5000 {
+                        theme.text_muted
+                    } else {
+                        theme.text_secondary
+                    };
+                    let app_color = if tagged { theme.text_muted } else { proto_color(f.app, theme) };
                     mono_cell(ui, format!("{:<25}", remote), base);
-                    mono_cell(ui, format!("{:<12}", f.app), proto_color(f.app, theme));
+                    mono_cell(ui, format!("{:<12}", f.app), app_color);
                     mono_cell(ui, format!("{:<5}", f.proto), theme.text_muted);
                     mono_cell(ui, format!("{:>10}", format_bytes_short(f.down)), base);
                     mono_cell(ui, format!("{:>10}", format_bytes_short(f.up)), base);
-                    let rate_color = if f.rate > 0.0 { theme.text_primary } else { theme.text_muted };
-                    mono_cell(ui, format!("{:>11}", format_rate(f.rate)), rate_color);
+                    if tagged {
+                        mono_cell(ui, format!("{:>11}", f.status), theme.text_muted);
+                    } else {
+                        let rate_color = if f.rate > 0.0 { theme.text_primary } else { theme.text_muted };
+                        mono_cell(ui, format!("{:>11}", format_rate(f.rate)), rate_color);
+                    }
                 });
             }
         });

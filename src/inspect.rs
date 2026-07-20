@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -138,6 +138,35 @@ impl AppProto {
             | AppProto::Icmp => 2,
             // Payload-signature protocols.
             AppProto::Tls | AppProto::Quic | AppProto::WireGuard => 3,
+        }
+    }
+}
+
+/// Engine lifecycle status of a flow, set by the connection manager's admission
+/// control. The default is `Active` (a normal proxied flow). `Shed` and `Reaped`
+/// mark flows the engine deliberately did NOT carry — so the dashboard and CSV
+/// present them as expected admission-control actions instead of anomalous
+/// up-only or half-open conversations (a shed SYN gets no reply; a reaped
+/// half-open dies before Established).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FlowStatus {
+    /// Normal proxied flow.
+    Active,
+    /// Admission was denied (over the memory budget / flow ceiling); the SYN or
+    /// first datagram was dropped rather than allocated. The peer retransmits.
+    Shed,
+    /// A half-open flow that never reached Established within the handshake
+    /// window, torn down by the engine.
+    Reaped,
+}
+
+impl FlowStatus {
+    /// Display/CSV label. `Active` is empty so ordinary rows carry no badge.
+    pub fn label(self) -> &'static str {
+        match self {
+            FlowStatus::Active => "",
+            FlowStatus::Shed => "shed",
+            FlowStatus::Reaped => "reaped",
         }
     }
 }
@@ -434,6 +463,9 @@ struct Flow {
     last_seen: Instant,
     last_total: u64,
     rate: f64,
+    /// Admission-control status, set out-of-band by the connection manager (see
+    /// `TrafficMonitor::note_flow`). Packet recording never changes it.
+    status: FlowStatus,
 }
 
 /// A flow's lifetime totals with wall-clock bounds — the unit the shutdown CSV
@@ -450,6 +482,7 @@ struct FlowRecord {
     pkts: u64,
     first: SystemTime,
     last: SystemTime,
+    status: &'static str,
 }
 
 /// Convert a live flow to its archival record. Wall times derive from the
@@ -467,6 +500,7 @@ fn record_of(k: &FlowKey, f: &Flow, wall_base: SystemTime, mono_base: Instant) -
         pkts: f.pkts,
         first: wall(f.first_seen),
         last: wall(f.last_seen),
+        status: f.status.label(),
     }
 }
 
@@ -577,6 +611,7 @@ impl TrafficMonitor {
             last_seen: now,
             last_total: 0,
             rate: 0.0,
+            status: FlowStatus::Active,
         });
 
         // Upgrade-only classification: adopt the new label only when it is
@@ -644,6 +679,25 @@ impl TrafficMonitor {
         }
     }
 
+    /// Tag a flow with an engine admission-control status so the dashboard and
+    /// CSV show a deliberately shed or reaped flow as an expected action, not an
+    /// anomalous half-open / up-only conversation. Keyed the same way `record`
+    /// keys the two directions of a conversation, so it lands on the existing
+    /// row. IPv4 only (mirrors the engine's capture); a no-op if the flow isn't
+    /// in the live table (already archived, or never recorded).
+    pub fn note_flow(&self, tcp: bool, remote: SocketAddrV4, local_port: u16, status: FlowStatus) {
+        let key = FlowKey {
+            remote_ip: IpAddr::V4(*remote.ip()),
+            remote_port: remote.port(),
+            local_port,
+            l4: if tcp { "TCP" } else { "UDP" },
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(f) = inner.flows.get_mut(&key) {
+            f.status = status;
+        }
+    }
+
     /// Write every flow of the session — archived AND still-live — as CSV to
     /// `path`, ordered by first-seen. Returns the number of rows. Called on
     /// shutdown.
@@ -656,8 +710,10 @@ impl TrafficMonitor {
         records.sort_by_key(|r| r.first);
 
         let mut out = String::with_capacity(80 + records.len() * 96);
+        // `status` is appended last so existing name-based readers (e.g.
+        // visualize_flows.py) are unaffected; it is empty for ordinary flows.
         out.push_str(
-            "first_seen,last_seen,remote,l4,app,local_port,up_bytes,down_bytes,packets\n",
+            "first_seen,last_seen,remote,l4,app,local_port,up_bytes,down_bytes,packets,status\n",
         );
         let fmt = |t: SystemTime| {
             chrono::DateTime::<chrono::Local>::from(t)
@@ -666,7 +722,7 @@ impl TrafficMonitor {
         };
         for r in &records {
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{}\n",
                 fmt(r.first),
                 fmt(r.last),
                 r.remote,
@@ -676,6 +732,7 @@ impl TrafficMonitor {
                 r.up,
                 r.down,
                 r.pkts,
+                r.status,
             ));
         }
         std::fs::write(path, out)?;
@@ -698,6 +755,7 @@ impl TrafficMonitor {
                 down: f.down,
                 rate: f.rate,
                 idle_ms: now.duration_since(f.last_seen).as_millis() as u64,
+                status: f.status.label(),
             })
             .collect();
         flows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
@@ -771,6 +829,8 @@ pub struct FlowRow {
     pub down: u64,
     pub rate: f64,
     pub idle_ms: u64,
+    /// Engine admission status: "" (active), "shed", or "reaped".
+    pub status: &'static str,
 }
 
 #[cfg(test)]

@@ -9,6 +9,31 @@
 //! New flows are detected by peeking at inbound IP packets (a TCP SYN, or the
 //! first datagram of a UDP 5-tuple); `iface.set_any_ip(true)` lets us create a
 //! socket bound to the *destination* the app is trying to reach.
+//!
+//! # This is split TCP, and it matters for sizing
+//!
+//! The app's connection terminates HERE — we answer its SYN — and we open a
+//! SEPARATE outbound connection to the real server. So a smoltcp socket buffer
+//! only ever spans the app<->proxy leg, which is a ~0-RTT hop across the local
+//! TUN. The WAN bandwidth-delay product lives on the OUTBOUND leg: for `Direct`
+//! that's a real OS kernel socket (the OS receive-window-autotunes it; we never
+//! clamp SO_RCVBUF/SO_SNDBUF), for WireGuard it's the inner smoltcp in `wg.rs`.
+//! Result: the app-leg buffer needs only to cover one loop-latency hop, so a
+//! modest buffer is sufficient for full single-stream throughput AND lets far
+//! more flows share a fixed budget. Bigger app-leg buffers buy bufferbloat, not
+//! speed.
+//!
+//! # Admission is by memory budget
+//!
+//! This engine captures the host's entire default route, so flow creation is an
+//! attacker-influenced, unbounded input. Each new flow pins socket buffers and
+//! spawns a real pinned outbound connection. Flows are therefore admitted against
+//! a fixed global byte budget (buffer size x flow count trade off automatically —
+//! the budget is the one knob), with a hard count backstop for structural
+//! overhead. Past the gate the SYN is shed (app retries, as against a congested
+//! host), never allocated. Liveness is smoltcp keepalive + timeout, so idle-but-
+//! alive sessions survive while dead peers are reset; half-open flood flows are
+//! reaped fast by an explicit handshake deadline.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -23,14 +48,68 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
+use crate::inspect::{FlowStatus, TrafficMonitor};
 use crate::outbound::Outbound;
 
-const TCP_BUF: usize = 2 * 1024 * 1024;
+/// Per-direction smoltcp socket buffer. Sized for the ~0-RTT app<->proxy leg (see
+/// module docs): even at a pessimistic ~4 ms poll-loop latency this sustains
+/// ~256 Mbit/s on that hop, and typical latency is far lower — never the WAN
+/// bottleneck, which the outbound leg owns. Smaller than a WAN BDP on purpose:
+/// it maximizes flow density under the budget and avoids local bufferbloat.
+const TCP_BUF: usize = 128 * 1024;
+
+/// The app-leg TCP window, exposed so the WireGuard exit (`wg.rs`) can statically
+/// assert its inner WAN-leg window is at least this large. The two legs are sized
+/// independently ON PURPOSE — this one for the ~0-RTT app<->proxy hop, wg's for
+/// the WAN bandwidth-delay product — and that check pins their relationship so a
+/// future edit can't silently invert it and make the WireGuard leg the smaller,
+/// throughput-capping window.
+pub(crate) const APP_LEG_TCP_WINDOW: usize = TCP_BUF;
+
 const UDP_PAYLOAD_BUF: usize = 256 * 1024;
 const UDP_META: usize = 64;
 const CHAN_CAP: usize = 128;
 const READ_CHUNK: usize = 16 * 1024;
 const UDP_IDLE: Duration = Duration::from_secs(30);
+
+/// Global memory budgets — the primary admission gate. A flow is admitted only
+/// while its worst-case footprint still fits. This is memory-anchored: change a
+/// buffer size and admission re-derives itself, so there is ONE knob (the budget)
+/// instead of a hand-tuned count that must be kept in sync with buffer sizes.
+///   TCP: 1 GiB / TCP_FLOW_COST (384 KiB) ~= 2730 concurrent flows
+///   UDP: 512 MiB / UDP_FLOW_COST (~514 KiB) ~= 1020 concurrent flows
+const TCP_MEM_BUDGET: usize = 1024 * 1024 * 1024;
+const UDP_MEM_BUDGET: usize = 512 * 1024 * 1024;
+
+/// Worst-case bytes one flow can pin: both socket buffers plus the transient
+/// queue/metadata. Charged at open, refunded at close, so the live sum is an
+/// exact bound, not an estimate.
+const TCP_FLOW_COST: usize = 2 * TCP_BUF + TCP_BUF; // rx + tx + pending_out ceiling
+const UDP_FLOW_COST: usize =
+    2 * UDP_PAYLOAD_BUF + 2 * UDP_META * std::mem::size_of::<udp::PacketMetadata>();
+
+/// Hard count backstops, independent of bytes: bound the HashMap / SocketSet /
+/// spawned-task overhead so no degenerate low-byte regime can explode structural
+/// memory. At the buffer sizes above the byte budget binds first; these only
+/// matter if buffers are later shrunk hard.
+const MAX_TCP_FLOWS: usize = 8192;
+const MAX_UDP_FLOWS: usize = 4096;
+
+/// Half-open flood guard: a flow that never reaches Established within this
+/// window is an abandoned SYN or a flood probe. Reaped explicitly (fast, and
+/// independent of smoltcp's internal timers) — this is the primary bound on
+/// flood-driven accumulation.
+const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Established-flow liveness. smoltcp sends keepalive probes every
+/// `TCP_KEEPALIVE_SECS`; a live app's kernel ACKs them automatically (whether or
+/// not the app is reading), so idle-but-alive sessions are refreshed and never
+/// cut. A dead/crashed app stops ACKing and smoltcp aborts the connection after
+/// `TCP_TIMEOUT_SECS` of silence, surfacing here as `State::Closed`. This is
+/// correct dead-vs-idle detection — it replaces any blunt idle timer, which could
+/// only ever guess.
+const TCP_KEEPALIVE_SECS: u64 = 15;
+const TCP_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
 struct FourTuple {
@@ -97,14 +176,18 @@ pub fn parse_flow(pkt: &[u8]) -> Option<Flow> {
 
 struct TcpConn {
     handle: SocketHandle,
-    /// Poll loop → outbound (app bytes). `None` once the app half-closed.
+    /// Poll loop -> outbound (app bytes). `None` once the app half-closed.
     app_to_out: Option<mpsc::Sender<Vec<u8>>>,
-    /// Outbound → poll loop (server bytes).
+    /// Outbound -> poll loop (server bytes).
     out_to_app: mpsc::Receiver<Vec<u8>>,
     /// Server bytes waiting for room in the smoltcp tx buffer.
     pending_out: VecDeque<u8>,
     established: bool,
     out_eof: bool,
+    /// When the flow was opened — bounds the SYN->Established handshake so a
+    /// half-open flood can't accumulate. Established liveness is smoltcp's job
+    /// (keepalive + timeout), not a field here.
+    opened_at: Instant,
 }
 
 struct UdpConn {
@@ -118,14 +201,14 @@ struct UdpConn {
 
 /// Byte counters at the *exit boundary* — the real outbound sockets. The
 /// TUN-side monitor cannot see this hop; comparing the two localizes loss:
-/// exit-read high with TUN-down low → bytes die inside our stack; exit-read
-/// near zero mid-transfer → the server paused because our kernel window
-/// closed, i.e. the app isn't ACKing and the TUN→app hop is the suspect.
+/// exit-read high with TUN-down low -> bytes die inside our stack; exit-read
+/// near zero mid-transfer -> the server paused because our kernel window
+/// closed, i.e. the app isn't ACKing and the TUN->app hop is the suspect.
 #[derive(Default)]
 pub struct ExitStats {
-    /// Bytes read from the internet (server → us).
+    /// Bytes read from the internet (server -> us).
     pub read: AtomicU64,
-    /// Bytes written to the internet (us → server).
+    /// Bytes written to the internet (us -> server).
     pub written: AtomicU64,
 }
 
@@ -133,7 +216,17 @@ pub struct ConnManager {
     outbound: Arc<dyn Outbound>,
     tcp: HashMap<FourTuple, TcpConn>,
     udp: HashMap<FourTuple, UdpConn>,
-    /// Downstream waker: outbound tasks signal it whenever server→app bytes
+    /// Live sum of TCP_FLOW_COST over open TCP flows — the admission gate. Plain
+    /// usize (not atomic): ConnManager is owned and mutated only by the engine's
+    /// single poll task, so there is no sharing to synchronize.
+    tcp_bytes: usize,
+    /// Live sum of UDP_FLOW_COST over open UDP flows.
+    udp_bytes: usize,
+    /// Observability sink. Admission decisions (shed / reap) are reported here so
+    /// the dashboard tags those flows as deliberate engine actions rather than
+    /// letting them read as anomalous half-open / up-only conversations.
+    monitor: Arc<TrafficMonitor>,
+    /// Downstream waker: outbound tasks signal it whenever server->app bytes
     /// land in an `out_to_app` channel (and on task exit, so EOF propagates
     /// promptly). The engine selects on it — same pattern as the wg.rs driver.
     wake: Arc<Notify>,
@@ -142,11 +235,14 @@ pub struct ConnManager {
 }
 
 impl ConnManager {
-    pub fn new(outbound: Arc<dyn Outbound>) -> Self {
+    pub fn new(outbound: Arc<dyn Outbound>, monitor: Arc<TrafficMonitor>) -> Self {
         Self {
             outbound,
             tcp: HashMap::new(),
             udp: HashMap::new(),
+            tcp_bytes: 0,
+            udp_bytes: 0,
+            monitor,
             wake: Arc::new(Notify::new()),
             stats: Arc::new(ExitStats::default()),
         }
@@ -163,12 +259,43 @@ impl ConnManager {
     }
 
     /// Inspect a captured packet and open a new flow if needed. Called before the
-    /// packet is handed to smoltcp so the accepting socket exists in time.
+    /// packet is handed to smoltcp so the accepting socket exists in time. A new
+    /// flow is admitted only while it fits the global byte budget and the hard
+    /// count backstop; past either, the packet is shed (see module docs) rather
+    /// than allocated.
     pub fn on_packet(&mut self, sockets: &mut SocketSet, flow: &Flow) {
         let key = FourTuple { src: flow.src, dst: flow.dst };
         match flow.proto {
-            6 if flow.syn && !self.tcp.contains_key(&key) => self.open_tcp(sockets, key),
-            17 if !self.udp.contains_key(&key) => self.open_udp(sockets, key),
+            6 if flow.syn && !self.tcp.contains_key(&key) => {
+                if self.tcp.len() >= MAX_TCP_FLOWS
+                    || self.tcp_bytes + TCP_FLOW_COST > TCP_MEM_BUDGET
+                {
+                    debug!(
+                        "tcp admission denied (flows {}, {} MiB used) — shedding SYN -> {}",
+                        self.tcp.len(),
+                        self.tcp_bytes / (1024 * 1024),
+                        key.dst
+                    );
+                    self.monitor.note_flow(true, key.dst, key.src.port(), FlowStatus::Shed);
+                    return;
+                }
+                self.open_tcp(sockets, key);
+            }
+            17 if !self.udp.contains_key(&key) => {
+                if self.udp.len() >= MAX_UDP_FLOWS
+                    || self.udp_bytes + UDP_FLOW_COST > UDP_MEM_BUDGET
+                {
+                    debug!(
+                        "udp admission denied (flows {}, {} MiB used) — shedding -> {}",
+                        self.udp.len(),
+                        self.udp_bytes / (1024 * 1024),
+                        key.dst
+                    );
+                    self.monitor.note_flow(false, key.dst, key.src.port(), FlowStatus::Shed);
+                    return;
+                }
+                self.open_udp(sockets, key);
+            }
             _ => {}
         }
     }
@@ -183,6 +310,11 @@ impl ConnManager {
             warn!("tcp listen({}) failed: {:?}", key.dst, e);
             return;
         }
+        // Established-flow liveness (see module docs): keepalive probes keep an
+        // idle-but-alive app's connection fresh; a dead app trips the timeout and
+        // smoltcp aborts, surfacing as State::Closed in dispatch.
+        sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(TCP_KEEPALIVE_SECS)));
+        sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_TIMEOUT_SECS)));
         let handle = sockets.add(sock);
 
         let (app_tx, app_rx) = mpsc::channel::<Vec<u8>>(CHAN_CAP);
@@ -200,8 +332,13 @@ impl ConnManager {
                 pending_out: VecDeque::new(),
                 established: false,
                 out_eof: false,
+                opened_at: Instant::now(),
             },
         );
+        self.tcp_bytes += TCP_FLOW_COST;
+        // A prior SYN to this 5-tuple may have been shed under pressure; now that
+        // it's admitted, clear that tag so the row reads as the live flow it is.
+        self.monitor.note_flow(true, key.dst, key.src.port(), FlowStatus::Active);
         debug!("tcp open -> {}", dst);
     }
 
@@ -238,6 +375,8 @@ impl ConnManager {
                 last: Instant::now(),
             },
         );
+        self.udp_bytes += UDP_FLOW_COST;
+        self.monitor.note_flow(false, key.dst, key.src.port(), FlowStatus::Active);
         debug!("udp open -> {}", dst);
     }
 
@@ -250,6 +389,9 @@ impl ConnManager {
 
     fn dispatch_tcp(&mut self, sockets: &mut SocketSet) {
         let mut remove = Vec::new();
+        // Keys reaped for a handshake timeout, tagged in the monitor after the
+        // borrow of self.tcp ends (note_flow needs &self.monitor).
+        let mut reaped: Vec<FourTuple> = Vec::new();
         for (key, conn) in self.tcp.iter_mut() {
             let sock = sockets.get_mut::<tcp::Socket>(conn.handle);
 
@@ -302,11 +444,11 @@ impl ConnManager {
                             _ => break,
                         }
                     }
-                    Err(_) => break, // channel full/closed → smoltcp window backpressure
+                    Err(_) => break, // channel full/closed -> smoltcp window backpressure
                 }
             }
 
-            // app half-closed (FIN received, rx drained) → stop writing to outbound
+            // app half-closed (FIN received, rx drained) -> stop writing to outbound
             if conn.established
                 && conn.app_to_out.is_some()
                 && !sock.may_recv()
@@ -315,9 +457,22 @@ impl ConnManager {
                 conn.app_to_out = None;
             }
 
-            // outbound closed and everything flushed → close our side
+            // outbound closed and everything flushed -> close our side
             if conn.out_eof && conn.pending_out.is_empty() {
                 sock.close();
+            }
+
+            // Half-open flood guard: a flow that never reached Established within
+            // the handshake window is abandoned/hostile — RST it so the app fails
+            // fast and the resources free now. Established liveness is handled by
+            // smoltcp keepalive+timeout (set at open), which surfaces below as
+            // State::Closed once a dead peer stops ACKing probes.
+            if !conn.established && conn.opened_at.elapsed() > TCP_HANDSHAKE_TIMEOUT {
+                sock.abort();
+                debug!("tcp reap {} (handshake timeout)", key.dst);
+                reaped.push(*key);
+                remove.push(*key);
+                continue;
             }
 
             if sock.state() == tcp::State::Closed {
@@ -327,8 +482,12 @@ impl ConnManager {
         for key in remove {
             if let Some(conn) = self.tcp.remove(&key) {
                 sockets.remove(conn.handle);
+                self.tcp_bytes = self.tcp_bytes.saturating_sub(TCP_FLOW_COST);
                 debug!("tcp close {}", key.dst);
             }
+        }
+        for key in reaped {
+            self.monitor.note_flow(true, key.dst, key.src.port(), FlowStatus::Reaped);
         }
     }
 
@@ -377,6 +536,7 @@ impl ConnManager {
         for key in remove {
             if let Some(conn) = self.udp.remove(&key) {
                 sockets.remove(conn.handle);
+                self.udp_bytes = self.udp_bytes.saturating_sub(UDP_FLOW_COST);
                 debug!("udp expire {}", key.dst);
             }
         }
@@ -405,7 +565,7 @@ async fn tcp_task(
     };
     let (mut rd, mut wr) = tokio::io::split(stream);
 
-    // outbound → app. Every delivery wakes the poll loop immediately —
+    // outbound -> app. Every delivery wakes the poll loop immediately —
     // downstream latency is scheduler latency, not a 200 ms timer. Dropping
     // out_tx signals EOF; the final notify makes the poll loop see it now.
     let reader_wake = wake.clone();
@@ -429,7 +589,7 @@ async fn tcp_task(
         reader_wake.notify_one();
     };
 
-    // app → outbound
+    // app -> outbound
     let writer = async move {
         while let Some(chunk) = app_rx.recv().await {
             if wr.write_all(&chunk).await.is_err() {
@@ -514,7 +674,7 @@ mod tests {
         pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
         pkt[20..22].copy_from_slice(&40000u16.to_be_bytes());
         pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
-        pkt[33] = 0x02; // flags byte at l4 offset 13 → pkt[20+13]=pkt[33]
+        pkt[33] = 0x02; // flags byte at l4 offset 13 -> pkt[20+13]=pkt[33]
         let f = parse_flow(&pkt).unwrap();
         assert_eq!(f.proto, 6);
         assert!(f.syn);
@@ -540,5 +700,16 @@ mod tests {
     #[test]
     fn ignores_non_ipv4() {
         assert!(parse_flow(&[0x60, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn budget_costs_are_positive_and_fit() {
+        // A single flow's worst case must fit its budget (else nothing is ever
+        // admitted), and the byte-derived ceiling must sit within the hard count
+        // backstop so the two gates are consistent.
+        assert!(TCP_FLOW_COST > 0 && TCP_FLOW_COST <= TCP_MEM_BUDGET);
+        assert!(UDP_FLOW_COST > 0 && UDP_FLOW_COST <= UDP_MEM_BUDGET);
+        assert!(TCP_MEM_BUDGET / TCP_FLOW_COST <= MAX_TCP_FLOWS);
+        assert!(UDP_MEM_BUDGET / UDP_FLOW_COST <= MAX_UDP_FLOWS);
     }
 }
