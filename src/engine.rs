@@ -90,7 +90,7 @@ pub async fn run(
     // Bring up the TUN and keep the adapter alive for the session.
     let tun = TunIo::new(settings.tun_ip, settings.tun_prefix, settings.mtu)
         .context("failed to create TUN device")?;
-    let (name, mut rx, tx, _tun_keepalive) = tun.into_parts();
+    let (name, mut rx, tx, mut tun_keepalive) = tun.into_parts();
     info!("TUN '{}' up at {}/{}", name, settings.tun_ip, settings.tun_prefix);
 
     // Optionally redirect the default route into the TUN (full capture).
@@ -186,7 +186,7 @@ pub async fn run(
         .add_default_ipv4_route(Ipv4Address::new(o[0], o[1], o[2], o[3]));
 
     let mut sockets = SocketSet::new(vec![]);
-    let mut conn = ConnManager::new(outbound, monitor.clone());
+    let mut conn = ConnManager::new(outbound);
     // Downstream waker: outbound tasks signal this the instant server bytes are
     // available, so the loop services them immediately instead of on a timer.
     let wake = conn.waker();
@@ -301,6 +301,18 @@ pub async fn run(
             break;
         }
     }
+
+    // Teardown order: stop capturing traffic (route guard), disarm the kill
+    // switch and tripwire, THEN remove the TUN. Routes/filters key on prefix and
+    // socket marks, not on the TUN handle, so removing the interface last avoids
+    // a window where the default route points at a dead interface. Awaiting the
+    // TUN shutdown makes interface removal deterministic (its worker threads
+    // release the adapter handle here, not whenever the runtime happens to reap
+    // them), so the next launch always starts from a clean adapter.
+    drop(_tripwire);
+    drop(_killswitch_guard);
+    drop(_route_guard);
+    tun_keepalive.shutdown().await;
 
     // Session flow data → CSV: everything the monitor saw, including flows
     // evicted from the live table mid-session. Written next to the executable
