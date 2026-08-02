@@ -23,6 +23,16 @@ pub const SERIES_LEN: usize = 120;
 const MAX_FLOWS: usize = 256;
 /// Flows idle longer than this are moved from the live table to the archive.
 const FLOW_IDLE_EVICT: Duration = Duration::from_secs(90);
+/// Hard cap on live per-flow rows tracked at once. The data path (conn.rs) is
+/// memory-budgeted against attacker-influenced unbounded flow creation; the
+/// monitor MUST be too, or a flow flood exhausts memory here regardless of what
+/// conn.rs sheds. Global byte/packet totals are always counted; only NEW
+/// per-flow tracking is declined once full. Sized at conn.rs's MAX_TCP_FLOWS.
+const MAX_LIVE_FLOWS: usize = 8192;
+/// Hard cap on archived (evicted) flow records. Oldest are dropped past this so
+/// a long, churny session can't grow the archive without bound; the dropped
+/// count is reported once at shutdown.
+const MAX_ARCHIVE: usize = 65_536;
 
 /// Packet direction relative to the local host.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -514,8 +524,12 @@ struct Inner {
     up_series: VecDeque<f64>,
     down_series: VecDeque<f64>,
     flows: HashMap<FlowKey, Flow>,
-    /// Every flow evicted from the live table, with its lifetime totals.
-    archive: Vec<FlowRecord>,
+    /// Flows evicted from the live table, with their lifetime totals. Bounded
+    /// ring (see `MAX_ARCHIVE`): oldest records fall off under sustained churn.
+    archive: VecDeque<FlowRecord>,
+    /// Archived records dropped to honor `MAX_ARCHIVE` — surfaced at shutdown so
+    /// the CSV's incompleteness is stated, not silent.
+    archive_dropped: u64,
     proto_bytes: HashMap<&'static str, u64>,
     last_tick: Instant,
     /// Clock base pair for converting monotonic stamps to wall time at export.
@@ -535,7 +549,8 @@ impl Inner {
             up_series: VecDeque::from(vec![0.0; SERIES_LEN]),
             down_series: VecDeque::from(vec![0.0; SERIES_LEN]),
             flows: HashMap::new(),
-            archive: Vec::new(),
+            archive: VecDeque::new(),
+            archive_dropped: 0,
             proto_bytes: HashMap::new(),
             last_tick: now,
             wall_base: SystemTime::now(),
@@ -601,6 +616,16 @@ impl TrafficMonitor {
         let Inner {
             flows, proto_bytes, ..
         } = &mut *inner;
+
+        // Bound live per-flow tracking against unbounded flow creation (the same
+        // adversarial input conn.rs budgets for). The packet is already in the
+        // global counters above; here we only decline to OPEN a new row once the
+        // table is full. The `contains_key` probe is evaluated only at the cap,
+        // so the common path keeps its single `entry` lookup.
+        if flows.len() >= MAX_LIVE_FLOWS && !flows.contains_key(&key) {
+            *proto_bytes.entry(parsed.app.label()).or_insert(0) += len;
+            return;
+        }
 
         let flow = flows.entry(key).or_insert_with(|| Flow {
             app: parsed.app,
@@ -669,7 +694,11 @@ impl TrafficMonitor {
         for k in idle {
             if let Some(f) = inner.flows.remove(&k) {
                 let rec = record_of(&k, &f, inner.wall_base, inner.mono_base);
-                inner.archive.push(rec);
+                if inner.archive.len() >= MAX_ARCHIVE {
+                    inner.archive.pop_front();
+                    inner.archive_dropped += 1;
+                }
+                inner.archive.push_back(rec);
             }
         }
         for f in inner.flows.values_mut() {
@@ -703,7 +732,14 @@ impl TrafficMonitor {
     /// shutdown.
     pub fn write_csv(&self, path: &std::path::Path) -> std::io::Result<usize> {
         let inner = self.inner.lock().unwrap();
-        let mut records: Vec<FlowRecord> = inner.archive.clone();
+        if inner.archive_dropped > 0 {
+            tracing::warn!(
+                "flow archive capped at {} records; {} older flows were dropped and \
+                 are absent from the CSV",
+                MAX_ARCHIVE, inner.archive_dropped
+            );
+        }
+        let mut records: Vec<FlowRecord> = inner.archive.iter().cloned().collect();
         for (k, f) in &inner.flows {
             records.push(record_of(k, f, inner.wall_base, inner.mono_base));
         }

@@ -186,7 +186,7 @@ pub async fn run(
         .add_default_ipv4_route(Ipv4Address::new(o[0], o[1], o[2], o[3]));
 
     let mut sockets = SocketSet::new(vec![]);
-    let mut conn = ConnManager::new(outbound);
+    let mut conn = ConnManager::new(outbound, monitor.clone());
     // Downstream waker: outbound tasks signal this the instant server bytes are
     // available, so the loop services them immediately instead of on a timer.
     let wake = conn.waker();

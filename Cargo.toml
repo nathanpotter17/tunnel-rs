@@ -3,10 +3,11 @@ name = "tunnel"
 version = "0.1.0"
 edition = "2021"
 description = "Software-defined egress engine with traffic observability + file sharing"
-license = "MIT"
+license = "BSD"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 snow = "0.9"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

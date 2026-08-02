@@ -29,6 +29,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio_util::sync::PollSender;
 use tracing::{debug, error};
 
 use crate::outbound::{Outbound, UdpConn};
@@ -63,6 +64,15 @@ const _: () = assert!(
 /// avoids PMTU blackholes that would otherwise stall large transfers — PMTUD
 /// doesn't propagate cleanly through a userspace double tunnel.
 const INNER_MTU: usize = 1280;
+
+/// Bounded capacity (in datagrams/chunks) for each per-flow bridge channel.
+/// Unbounded channels here would defeat flow control: a fast local writer over a
+/// slow WAN (from_app), or a slow local reader behind a fast WAN (to_app), would
+/// grow the queue without bound, per flow. Bounding it turns "queue full" into
+/// real backpressure — TCP leaves bytes in the smoltcp rx buffer so the inner
+/// window closes and the WAN peer is throttled; UDP drops, matching its
+/// semantics. Mirrors conn.rs's CHAN_CAP.
+const FLOW_CHAN_CAP: usize = 128;
 
 /// Resolved WireGuard parameters.
 pub struct WgConfig {
@@ -158,8 +168,8 @@ impl Outbound for WireGuard {
 
 struct TcpBridge {
     handle: SocketHandle,
-    from_app: mpsc::UnboundedReceiver<Vec<u8>>,
-    to_app: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    from_app: mpsc::Receiver<Vec<u8>>,
+    to_app: Option<mpsc::Sender<Vec<u8>>>,
     pending: VecDeque<u8>,
     app_eof: bool,
     established: bool,
@@ -168,8 +178,8 @@ struct TcpBridge {
 struct UdpBridge {
     handle: SocketHandle,
     dst: IpEndpoint,
-    from_app: mpsc::UnboundedReceiver<Vec<u8>>,
-    to_app: mpsc::UnboundedSender<Vec<u8>>,
+    from_app: mpsc::Receiver<Vec<u8>>,
+    to_app: mpsc::Sender<Vec<u8>>,
 }
 
 async fn driver(config: WgConfig, egress: EgressPin, mut req_rx: mpsc::Receiver<OpenReq>) -> Result<()> {
@@ -200,7 +210,6 @@ async fn driver(config: WgConfig, egress: EgressPin, mut req_rx: mpsc::Receiver<
     let mut next_port: u16 = 20000;
 
     let mut scratch = vec![0u8; SCRATCH];
-    // replace wg.rs lines 186-247 (recv_buf decl through end of the driver `loop`)
     let mut recv_buf = vec![0u8; SCRATCH];
 
     // boringtun needs its timers advanced periodically (handshake/keepalive/rekey);
@@ -356,8 +365,8 @@ fn open_flow(
             match sock.connect(iface.context(), remote, lport) {
                 Ok(()) => {
                     let handle = sockets.add(sock);
-                    let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
-                    let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+                    let (to_app_tx, to_app_rx) = mpsc::channel(FLOW_CHAN_CAP);
+                    let (from_app_tx, from_app_rx) = mpsc::channel(FLOW_CHAN_CAP);
                     tcp_conns.push(TcpBridge {
                         handle,
                         from_app: from_app_rx,
@@ -390,8 +399,8 @@ fn open_flow(
                 return;
             }
             let handle = sockets.add(sock);
-            let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
-            let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+            let (to_app_tx, to_app_rx) = mpsc::channel(FLOW_CHAN_CAP);
+            let (from_app_tx, from_app_rx) = mpsc::channel(FLOW_CHAN_CAP);
             udp_conns.push(UdpBridge { handle, dst: remote, from_app: from_app_rx, to_app: to_app_tx });
             let _ = reply.send(Ok(ChannelUdp::new(from_app_tx, to_app_rx, wake.clone())));
         }
@@ -431,20 +440,32 @@ fn service_tcp(sockets: &mut SocketSet, conns: &mut Vec<TcpBridge>) {
             }
         }
 
-        // smoltcp rx -> app
+        // smoltcp rx -> app. Reserve channel capacity BEFORE consuming from
+        // smoltcp: on a full channel the bytes stay in the smoltcp rx buffer, its
+        // window closes, and the WAN peer is backpressured — no unbounded queue,
+        // no data loss. A closed channel (app dropped its reader) ends delivery.
+        // The reserve `Result` borrows `c.to_app` for the whole match, so the
+        // closed case is recorded and applied AFTER the loop, once that borrow ends.
+        let mut app_closed = false;
         while sock.can_recv() {
             let Some(tx) = c.to_app.as_ref() else { break };
-            match sock.recv(|b| {
-                let n = b.len();
-                (n, b[..n].to_vec())
-            }) {
-                Ok(data) if !data.is_empty() => {
-                    if tx.send(data).is_err() {
-                        break;
-                    }
+            match tx.try_reserve() {
+                Ok(permit) => match sock.recv(|b| {
+                    let n = b.len();
+                    (n, b[..n].to_vec())
+                }) {
+                    Ok(data) if !data.is_empty() => permit.send(data),
+                    _ => break,
+                },
+                Err(mpsc::error::TrySendError::Full(())) => break,
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    app_closed = true;
+                    break;
                 }
-                _ => break,
             }
+        }
+        if app_closed {
+            c.to_app = None;
         }
 
         // remote (dst) closed sending → signal EOF to the app. Guard on
@@ -485,12 +506,17 @@ fn service_udp(sockets: &mut SocketSet, conns: &mut Vec<UdpBridge>) {
         }
         while sock.can_recv() {
             match sock.recv() {
-                Ok((data, _)) => {
-                    if c.to_app.send(data.to_vec()).is_err() {
+                Ok((data, _)) => match c.to_app.try_send(data.to_vec()) {
+                    Ok(()) => {}
+                    // UDP is lossy by contract: a full app-side queue drops the
+                    // datagram rather than stalling the whole driver. Keep draining
+                    // smoltcp so its buffer never wedges.
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
                         disconnected = true;
                         break;
                     }
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -582,16 +608,16 @@ impl phy::TxToken for InTx {
 // ============================================================================
 
 pub struct ChannelStream {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    tx: PollSender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     wake: Arc<Notify>,
     rem: Vec<u8>,
     pos: usize,
 }
 
 impl ChannelStream {
-    fn new(tx: mpsc::UnboundedSender<Vec<u8>>, rx: mpsc::UnboundedReceiver<Vec<u8>>, wake: Arc<Notify>) -> Self {
-        Self { tx, rx, wake, rem: Vec::new(), pos: 0 }
+    fn new(tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>, wake: Arc<Notify>) -> Self {
+        Self { tx: PollSender::new(tx), rx, wake, rem: Vec::new(), pos: 0 }
     }
 }
 
@@ -616,13 +642,24 @@ impl AsyncRead for ChannelStream {
 }
 
 impl AsyncWrite for ChannelStream {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.tx.send(buf.to_vec()) {
-            Ok(()) => {
-                self.wake.notify_one(); // driver services from_app immediately, not on a tick
-                Poll::Ready(Ok(buf.len()))
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskCx<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // Reserve a channel slot first. If the bridge is full this returns
+        // Pending and registers the waker, so the writer (conn.rs's outbound task)
+        // is parked instead of piling bytes into an unbounded queue — the WAN
+        // backpressure the whole split-TCP design depends on.
+        match this.tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => match this.tx.send_item(buf.to_vec()) {
+                Ok(()) => {
+                    this.wake.notify_one(); // driver services from_app now, not on a tick
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Err(_) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "wg flow closed"))),
+            },
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "wg flow closed")))
             }
-            Err(_) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "wg flow closed"))),
+            Poll::Pending => Poll::Pending,
         }
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
@@ -634,13 +671,13 @@ impl AsyncWrite for ChannelStream {
 }
 
 pub struct ChannelUdp {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
-    rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     wake: Arc<Notify>,
 }
 
 impl ChannelUdp {
-    fn new(tx: mpsc::UnboundedSender<Vec<u8>>, rx: mpsc::UnboundedReceiver<Vec<u8>>, wake: Arc<Notify>) -> Self {
+    fn new(tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>, wake: Arc<Notify>) -> Self {
         Self { tx, rx: Mutex::new(rx), wake }
     }
 }
@@ -648,11 +685,18 @@ impl ChannelUdp {
 #[async_trait]
 impl UdpConn for ChannelUdp {
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.tx
-            .send(buf.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wg flow closed"))?;
-        self.wake.notify_one();
-        Ok(buf.len())
+        // UDP is lossy by contract: a full bridge drops the datagram rather than
+        // blocking the caller. Only a closed bridge is an error.
+        match self.tx.try_send(buf.to_vec()) {
+            Ok(()) => {
+                self.wake.notify_one();
+                Ok(buf.len())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(buf.len()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "wg flow closed"))
+            }
+        }
     }
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut rx = self.rx.lock().await;
