@@ -29,6 +29,10 @@ const FLOW_IDLE_EVICT: Duration = Duration::from_secs(90);
 /// conn.rs sheds. Global byte/packet totals are always counted; only NEW
 /// per-flow tracking is declined once full. Sized at conn.rs's MAX_TCP_FLOWS.
 const MAX_LIVE_FLOWS: usize = 8192;
+/// Maximum unique remote hosts reported in a snapshot (display cap).
+const MAX_HOSTS: usize = 128;
+/// Maximum unique remote service ports reported in a snapshot (display cap).
+const MAX_PORTS: usize = 64;
 /// Hard cap on archived (evicted) flow records. Oldest are dropped past this so
 /// a long, churny session can't grow the archive without bound; the dropped
 /// count is reported once at shutdown.
@@ -805,30 +809,118 @@ impl TrafficMonitor {
 
 /// Render `Inner` into the immutable view the dashboard draws from. Called once
 /// per tick, with the monitor lock already held.
+///
+/// Every aggregate the dashboard can display is derived here, from the FULL live
+/// table — not from the truncated row slice, and not per frame in the renderer.
+/// A host rollup computed from the top 256 rows is not a host rollup; and a
+/// value that only moves once a second must not be recomputed sixty times a
+/// second under the lock the packet path takes.
 fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
-    let mut flows: Vec<FlowRow> = inner
-        .flows
-        .iter()
-        .map(|(k, f)| FlowRow {
+    let mut flows: Vec<FlowRow> = Vec::with_capacity(inner.flows.len());
+    let mut hosts: HashMap<IpAddr, HostAcc> = HashMap::new();
+    let mut ports: HashMap<(&'static str, u16), PortAcc> = HashMap::new();
+    let mut app_flows: HashMap<&'static str, usize> = HashMap::new();
+    let mut tcp_flows = 0usize;
+    let mut udp_flows = 0usize;
+
+    for (k, f) in &inner.flows {
+        let idle_ms = now.duration_since(f.last_seen).as_millis() as u64;
+        let bytes = f.up + f.down;
+        let app = f.app.label();
+
+        flows.push(FlowRow {
             remote: fmt_endpoint(k.remote_ip, k.remote_port),
             proto: k.l4,
-            app: f.app.label(),
+            app,
             up: f.up,
             down: f.down,
             rate: f.rate,
-            idle_ms: now.duration_since(f.last_seen).as_millis() as u64,
+            idle_ms,
             status: f.status.label(),
-        })
-        .collect();
+        });
+
+        match k.l4 {
+            "TCP" => tcp_flows += 1,
+            "UDP" => udp_flows += 1,
+            _ => {}
+        }
+        *app_flows.entry(app).or_insert(0) += 1;
+
+        // Host rollup: one row per unique remote address, however many
+        // conversations it carries. `idle` is the freshest of them, and the
+        // label is taken from the heaviest — a host is identified by what it
+        // mostly does, not by whichever flow hashed first.
+        let h = hosts.entry(k.remote_ip).or_insert_with(|| HostAcc {
+            idle_ms: u64::MAX,
+            ..HostAcc::default()
+        });
+        h.flows += 1;
+        h.up += f.up;
+        h.down += f.down;
+        h.rate += f.rate;
+        h.idle_ms = h.idle_ms.min(idle_ms);
+        if bytes >= h.top_bytes {
+            h.top_bytes = bytes;
+            h.app = app;
+        }
+
+        // Service rollup, keyed on the REMOTE port: the local port is ephemeral
+        // and rolling it up would produce one row per flow.
+        if k.remote_port != 0 {
+            let p = ports.entry((k.l4, k.remote_port)).or_default();
+            p.flows += 1;
+            p.up += f.up;
+            p.down += f.down;
+            p.rate += f.rate;
+        }
+    }
+
     flows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
     flows.truncate(MAX_FLOWS);
 
-    let mut protos: Vec<(String, u64)> = inner
+    let mut hosts: Vec<HostRow> = hosts
+        .into_iter()
+        .map(|(ip, a)| HostRow {
+            ip: ip.to_string(),
+            app: a.app,
+            flows: a.flows,
+            up: a.up,
+            down: a.down,
+            rate: a.rate,
+            idle_ms: if a.idle_ms == u64::MAX { 0 } else { a.idle_ms },
+        })
+        .collect();
+    hosts.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
+    hosts.truncate(MAX_HOSTS);
+
+    let mut ports: Vec<PortRow> = ports
+        .into_iter()
+        .map(|((l4, port), a)| PortRow {
+            port,
+            l4,
+            service: service_name(port),
+            flows: a.flows,
+            up: a.up,
+            down: a.down,
+            rate: a.rate,
+        })
+        .collect();
+    ports.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
+    ports.truncate(MAX_PORTS);
+
+    // Byte share is session-cumulative (it includes archived flows), so the
+    // composition view stays honest across a long session; the flow count is
+    // live, so the two columns answer different questions on purpose.
+    let mut apps: Vec<AppRow> = inner
         .proto_bytes
         .iter()
-        .map(|(k, v)| (k.to_string(), *v))
+        .map(|(name, bytes)| AppRow {
+            name: *name,
+            bytes: *bytes,
+            flows: app_flows.get(*name).copied().unwrap_or(0),
+        })
         .collect();
-    protos.sort_by(|a, b| b.1.cmp(&a.1));
+    apps.sort_by(|a, b| b.bytes.cmp(&a.bytes));
 
     TrafficSnapshot {
         total_up: inner.total_up,
@@ -840,8 +932,78 @@ fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
         up_series: inner.up_series.iter().copied().collect(),
         down_series: inner.down_series.iter().copied().collect(),
         active_flows: inner.flows.len(),
+        tcp_flows,
+        udp_flows,
+        archived_flows: inner.archive.len(),
         flows,
-        protos,
+        hosts,
+        ports,
+        apps,
+    }
+}
+
+/// Accumulator for the per-host rollup. Not part of the published view.
+#[derive(Default)]
+struct HostAcc {
+    app: &'static str,
+    flows: usize,
+    up: u64,
+    down: u64,
+    rate: f64,
+    idle_ms: u64,
+    top_bytes: u64,
+}
+
+/// Accumulator for the per-service rollup. Not part of the published view.
+#[derive(Default)]
+struct PortAcc {
+    flows: usize,
+    up: u64,
+    down: u64,
+    rate: f64,
+}
+
+/// Human name for a well-known remote port. Deliberately a superset of what
+/// `classify` fingerprints: this labels the *destination service* even when the
+/// flow's payload classification landed elsewhere (e.g. TLS on 993 is IMAPS).
+fn service_name(port: u16) -> &'static str {
+    match port {
+        20 | 21 => "ftp",
+        22 => "ssh",
+        23 => "telnet",
+        25 | 587 => "smtp",
+        53 => "dns",
+        67 | 68 => "dhcp",
+        80 => "http",
+        110 => "pop3",
+        123 => "ntp",
+        137..=139 => "netbios",
+        143 => "imap",
+        161 | 162 => "snmp",
+        389 => "ldap",
+        443 => "https",
+        445 => "smb",
+        465 => "smtps",
+        546 | 547 => "dhcpv6",
+        636 => "ldaps",
+        853 => "dns-tls",
+        993 => "imaps",
+        995 => "pop3s",
+        1194 => "openvpn",
+        1900 => "ssdp",
+        3128 | 8080 => "http-proxy",
+        3306 => "mysql",
+        3389 => "rdp",
+        5222 => "xmpp",
+        5353 => "mdns",
+        5355 => "llmnr",
+        5432 => "postgres",
+        6379 => "redis",
+        8388 | 8389 => "shadowsocks",
+        8443 => "https-alt",
+        27017 => "mongodb",
+        51820 => "wireguard",
+        _ => "",
     }
 }
 
@@ -864,7 +1026,9 @@ fn fmt_endpoint(ip: IpAddr, port: u16) -> String {
     }
 }
 
-/// Immutable view of the monitor's state for rendering.
+/// Immutable view of the monitor's state for rendering. Published once per tick
+/// and handed out as an `Arc`; every field is final at publication, so the
+/// dashboard never computes over live state.
 #[derive(Clone, Default)]
 pub struct TrafficSnapshot {
     pub total_up: u64,
@@ -875,9 +1039,20 @@ pub struct TrafficSnapshot {
     pub rate_down: f64,
     pub up_series: Vec<f64>,
     pub down_series: Vec<f64>,
+    /// Live flows tracked (untruncated count; `flows` is the display slice).
     pub active_flows: usize,
+    pub tcp_flows: usize,
+    pub udp_flows: usize,
+    /// Flows evicted to the archive so far this session.
+    pub archived_flows: usize,
+    /// Heaviest flows, descending by total bytes (capped at `MAX_FLOWS`).
     pub flows: Vec<FlowRow>,
-    pub protos: Vec<(String, u64)>,
+    /// Unique remote hosts, descending by total bytes (capped at `MAX_HOSTS`).
+    pub hosts: Vec<HostRow>,
+    /// Remote service ports, descending by total bytes (capped at `MAX_PORTS`).
+    pub ports: Vec<PortRow>,
+    /// Application protocols, descending by session bytes.
+    pub apps: Vec<AppRow>,
 }
 
 /// One row of the live flow table.
@@ -892,6 +1067,43 @@ pub struct FlowRow {
     pub idle_ms: u64,
     /// Engine admission status: "" (active), "shed", or "reaped".
     pub status: &'static str,
+}
+
+/// One unique remote host, with every flow to it collapsed into one row.
+#[derive(Clone)]
+pub struct HostRow {
+    pub ip: String,
+    /// Label of the host's heaviest flow.
+    pub app: &'static str,
+    pub flows: usize,
+    pub up: u64,
+    pub down: u64,
+    pub rate: f64,
+    /// Idle time of the host's freshest flow.
+    pub idle_ms: u64,
+}
+
+/// One remote service port, with every flow to it collapsed into one row.
+#[derive(Clone)]
+pub struct PortRow {
+    pub port: u16,
+    pub l4: &'static str,
+    /// Well-known service name, or "" if the port is not recognised.
+    pub service: &'static str,
+    pub flows: usize,
+    pub up: u64,
+    pub down: u64,
+    pub rate: f64,
+}
+
+/// One application protocol: session byte share and live flow count.
+#[derive(Clone)]
+pub struct AppRow {
+    pub name: &'static str,
+    /// Session-cumulative bytes, including flows already archived.
+    pub bytes: u64,
+    /// Flows currently live with this label.
+    pub flows: usize,
 }
 
 #[cfg(test)]
@@ -950,9 +1162,10 @@ mod tests {
         assert_eq!(snap.flows[0].app, "WireGuard");
         // Protocol byte totals were reattributed to the final identity.
         let total = (p1.len() + p2.len() + p3.len()) as u64;
-        let wg_bytes = snap.protos.iter().find(|(k, _)| k == "WireGuard").unwrap().1;
-        assert_eq!(wg_bytes, total);
-        assert!(snap.protos.iter().all(|(k, v)| k == "WireGuard" || *v == 0));
+        let wg = snap.apps.iter().find(|a| a.name == "WireGuard").unwrap();
+        assert_eq!(wg.bytes, total);
+        assert!(snap.apps.iter().all(|a| a.name == "WireGuard" || a.bytes == 0));
+        assert_eq!(wg.flows, 1);
     }
 
     #[test]
@@ -999,6 +1212,41 @@ mod tests {
         assert_eq!(snap.pkts_up, 1);
         assert!(!snap.flows.is_empty());
         assert_eq!(snap.flows[0].app, "DNS");
+    }
+
+    #[test]
+    fn rolls_up_hosts_ports_and_apps() {
+        let m = TrafficMonitor::new();
+        // Two conversations to one host on two services, one to another host.
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [1, 1, 1, 1], 40001, 53, &[7; 40]));
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [1, 1, 1, 1], 40002, 123, &[7; 40]));
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [9, 9, 9, 9], 40003, 53, &[7; 10]));
+        m.tick();
+        let snap = m.snapshot();
+
+        assert_eq!(snap.active_flows, 3);
+        assert_eq!(snap.udp_flows, 3);
+        assert_eq!(snap.tcp_flows, 0);
+
+        // Three flows collapse to two host rows, heaviest first.
+        assert_eq!(snap.hosts.len(), 2);
+        assert_eq!(snap.hosts[0].ip, "1.1.1.1");
+        assert_eq!(snap.hosts[0].flows, 2);
+        assert_eq!(snap.hosts[1].ip, "9.9.9.9");
+        assert_eq!(snap.hosts[1].flows, 1);
+
+        // ...and to two service rows, keyed on the REMOTE port only.
+        assert_eq!(snap.ports.len(), 2);
+        let dns = snap.ports.iter().find(|p| p.port == 53).unwrap();
+        assert_eq!(dns.flows, 2);
+        assert_eq!(dns.service, "dns");
+        assert_eq!(dns.l4, "UDP");
+        let ntp = snap.ports.iter().find(|p| p.port == 123).unwrap();
+        assert_eq!(ntp.flows, 1);
+        assert_eq!(ntp.service, "ntp");
+
+        let dns_app = snap.apps.iter().find(|a| a.name == "DNS").unwrap();
+        assert_eq!(dns_app.flows, 2);
     }
 
     #[test]

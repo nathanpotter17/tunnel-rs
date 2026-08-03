@@ -1,8 +1,9 @@
 //! Software-defined tunnel: smoltcp egress engine + live observability.
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 
 mod conn;
@@ -46,6 +47,8 @@ ARGS:
 OPTIONS:
     -s, --settings <P>   Settings file (same as the positional form)
         --no-route       Do not redirect the default route into the TUN
+        --log            Also write the full log transcript to
+                         tunnel-<timestamp>.txt, next to the session flow CSV
     -v, --verbose        Verbose logging
     -h, --help / -V, --version
 
@@ -54,9 +57,14 @@ silently ignored."
     );
 }
 
-/// Install a logger that prints to stdout (headless) and mirrors into the
-/// dashboard log ring (`Shared`).
-fn setup_logging(verbose: bool, shared: Arc<Shared>) {
+/// Install the process logger.
+///
+/// Console output is always on. `--log` adds a second sink writing the same
+/// stream, unstyled, to `tunnel-<stamp>.txt` beside the session flow CSV — the
+/// transcript is a file, not a UI surface. A panic hook writes to both, because
+/// the one message worth capturing above all others is the one that arrives on
+/// the way down.
+fn setup_logging(verbose: bool, log_file: Option<&Path>) -> Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -66,63 +74,76 @@ fn setup_logging(verbose: bool, shared: Arc<Shared>) {
         EnvFilter::new("tunnel=info")
     };
 
+    let sink = match log_file {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .with_context(|| format!("could not create log file {}", path.display()))?;
+            Some(FileSink(Arc::new(Mutex::new(file))))
+        }
+        None => None,
+    };
+
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(SharedLogLayer { shared })
+        .with(sink.clone().map(|s| {
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(s)
+        }))
         .init();
-}
 
-/// Tracing layer that mirrors events into `Shared.logs`.
-struct SharedLogLayer {
-    shared: Arc<Shared>,
-}
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(s) = &sink {
+            let mut w = s.clone();
+            let _ = writeln!(w, "PANIC: {info}");
+            let _ = w.flush();
+        }
+        default_hook(info);
+    }));
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SharedLogLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let level = match *event.metadata().level() {
-            tracing::Level::ERROR => "error",
-            tracing::Level::WARN => "warn",
-            tracing::Level::INFO => "info",
-            tracing::Level::DEBUG | tracing::Level::TRACE => "debug",
-        };
-        let mut v = MsgVisitor::default();
-        event.record(&mut v);
-        let msg = if !v.message.is_empty() {
-            v.message
-        } else if !v.fields.is_empty() {
-            v.fields.join(" ")
-        } else {
-            return;
-        };
-        self.shared.push_log(level, msg);
+    if let Some(path) = log_file {
+        tracing::info!("log transcript: {}", path.display());
     }
+    Ok(())
 }
 
-#[derive(Default)]
-struct MsgVisitor {
-    message: String,
-    fields: Vec<String>,
-}
+/// A shared, line-buffered handle to the transcript file.
+///
+/// `tracing-subscriber` needs a `MakeWriter` that can hand out an independent
+/// writer per event; the mutex serialises the interleaved records from the
+/// engine's tasks so lines never tear.
+#[derive(Clone)]
+struct FileSink(Arc<Mutex<std::fs::File>>);
 
-impl tracing::field::Visit for MsgVisitor {
-    fn record_debug(&mut self, f: &tracing::field::Field, val: &dyn std::fmt::Debug) {
-        if f.name() == "message" {
-            self.message = format!("{val:?}").trim_matches('"').to_string();
-        } else {
-            self.fields.push(format!("{}={val:?}", f.name()));
+impl std::io::Write for FileSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut f) => f.write(buf),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "log file mutex poisoned",
+            )),
         }
     }
-    fn record_str(&mut self, f: &tracing::field::Field, val: &str) {
-        if f.name() == "message" {
-            self.message = val.to_string();
-        } else {
-            self.fields.push(format!("{}={val}", f.name()));
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut f) => f.flush(),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "log file mutex poisoned",
+            )),
         }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for FileSink {
+    type Writer = FileSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }
 
@@ -133,6 +154,7 @@ async fn main() -> Result<()> {
     let mut settings_path: Option<PathBuf> = None;
     let mut verbose = false;
     let mut install_route = true;
+    let mut log_to_file = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -142,6 +164,7 @@ async fn main() -> Result<()> {
             "-V" | "--version" => { println!("tunnel {VERSION}"); return Ok(()); }
             "-v" | "--verbose" => verbose = true,
             "--no-route" => install_route = false,
+            "--log" => log_to_file = true,
             "-s" | "--settings" => { i += 1; settings_path = Some(PathBuf::from(args.get(i).context("--settings needs a path")?)); }
             a if a.starts_with('-') => bail!("unknown option: {a}"),
             a => positional.push(a.to_string()),
@@ -184,10 +207,12 @@ async fn main() -> Result<()> {
         return settings::init_config(&settings_path);
     }
 
-    // Logging first, so settings load messages reach stdout AND the dashboard
-    // log ring.
+    // Logging first, so settings-load messages reach the console and, when
+    // requested, the transcript. `Shared` is constructed before it because it
+    // owns the session paths the transcript is named from.
     let shared = Shared::new();
-    setup_logging(verbose, shared.clone());
+    let log_path = log_to_file.then(|| shared.session.log_txt());
+    setup_logging(verbose, log_path.as_deref())?;
 
     if settings_explicit && !settings_path.exists() {
         bail!("settings file not found: {}", settings_path.display());
@@ -217,11 +242,11 @@ async fn main() -> Result<()> {
                 egress,
                 orig_gateway,
                 dns_backend,
-                engine_shared.clone(),
+                engine_shared,
             )
             .await
             {
-                engine_shared.push_log("error", format!("engine: {e:#}"));
+                tracing::error!("engine: {e:#}");
             }
         });
         let gui_result =
@@ -235,7 +260,7 @@ async fn main() -> Result<()> {
         // Belt-and-suspenders: ensure the flag is set even on the Ctrl-C path.
         shared.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = engine.await {
-            shared.push_log("error", format!("engine task join: {e}"));
+            tracing::error!("engine task join: {e}");
         }
         gui_result
     }

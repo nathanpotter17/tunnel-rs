@@ -261,17 +261,10 @@ pub async fn run(
     tun_keepalive.shutdown().await;
 
     // Session flow data → CSV: everything the monitor saw, including flows
-    // evicted from the live table mid-session. Written next to the executable
-    // (the process CWD is unpredictable for a double-clicked GUI app and may not
-    // be writable); timestamped so sessions never clobber each other.
-    let csv_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let csv_path = csv_dir.join(format!(
-        "flows-{}.csv",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    ));
+    // evicted from the live table mid-session. The path is resolved once at
+    // startup (see `SessionPaths`) so the CSV and the `--log` transcript are
+    // named as a pair and land in the same directory.
+    let csv_path = shared.session.flows_csv();
     match monitor.write_csv(&csv_path) {
         Ok(n) => info!("flow table written to {} ({} flows)", csv_path.display(), n),
         Err(e) => warn!("could not write flow CSV {}: {}", csv_path.display(), e),
