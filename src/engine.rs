@@ -55,6 +55,7 @@ pub async fn run(
     install_route: bool,
     egress: EgressPin,
     orig_gateway: String,
+    dns_backend: crate::preflight::DnsBackend,
     shared: Arc<Shared>,
 ) -> Result<()> {
     let monitor = shared.monitor.clone();
@@ -108,12 +109,6 @@ pub async fn run(
         ) {
             Ok(guard) => {
                 info!("Default route redirected into the TUN — all traffic is now tunneled");
-                // Force DNS through the tunnel so lookups don't leak to a LAN
-                // resolver the exit can't reach.
-                match route::set_tun_dns(&name, settings.dns) {
-                    Ok(()) => info!("DNS pinned to {} through the tunnel", settings.dns),
-                    Err(e) => warn!("Could not set tunnel DNS ({e}); set it manually to {}", settings.dns),
-                }
                 Some(guard)
             }
             Err(e) => {
@@ -124,6 +119,27 @@ pub async fn run(
     } else {
         warn!("Running WITHOUT --route: the default route is untouched, so no host \
                traffic is captured. Pass --route to tunnel all traffic.");
+        None
+    };
+
+    // Resolver, pinned to the TUN and restored on drop. NOT optional under
+    // capture: the kill switch below drops unmarked traffic out the uplink, and
+    // that includes every query to a LAN resolver — so a resolver left on the
+    // uplink is a host with no DNS at all, silently, with the kill switch doing
+    // exactly its job. Declared AFTER _route_guard so it drops FIRST (resolver
+    // restored, then routes), matching the kill-switch ordering below.
+    let _dns_guard = if _route_guard.is_some() {
+        match route::DnsGuard::install(&name, settings.dns, dns_backend) {
+            Ok(g) => Some(g),
+            Err(e) => bail!(
+                "failed to pin the resolver to the tunnel ({e:#}); refusing to run \
+                 with capture, because the kill switch would then drop every DNS \
+                 query to your LAN resolver and name resolution would stop with no \
+                 visible error. Fix the cause, or pass --no-route to run without \
+                 capturing traffic."
+            ),
+        }
+    } else {
         None
     };
 
@@ -302,8 +318,8 @@ pub async fn run(
         }
     }
 
-    // Teardown order: stop capturing traffic (route guard), disarm the kill
-    // switch and tripwire, THEN remove the TUN. Routes/filters key on prefix and
+    // Teardown order: disarm the tripwire and kill switch, restore the resolver,
+    // stop capturing traffic (route guard), THEN remove the TUN. Routes/filters key on prefix and
     // socket marks, not on the TUN handle, so removing the interface last avoids
     // a window where the default route points at a dead interface. Awaiting the
     // TUN shutdown makes interface removal deterministic (its worker threads
@@ -311,6 +327,7 @@ pub async fn run(
     // them), so the next launch always starts from a clean adapter.
     drop(_tripwire);
     drop(_killswitch_guard);
+    drop(_dns_guard);
     drop(_route_guard);
     tun_keepalive.shutdown().await;
 

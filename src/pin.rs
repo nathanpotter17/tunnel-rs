@@ -23,8 +23,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
-/// Firewall mark stamped on every egress socket we own (the WireGuard/Direct
-/// exit sockets and the file channel). The kill switch (killswitch.rs) permits
+/// Firewall mark stamped on every egress socket we own (the WireGuard and
+/// Direct exit sockets). The kill switch (killswitch.rs) permits
 /// only marked traffic out the uplink and drops the rest — that drop is what
 /// closes the TunnelVision (CVE-2024-3661) leak, where a rogue DHCP option-121
 /// route would otherwise steer an app's flow straight out the uplink, bypassing
@@ -69,8 +69,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct EgressPin {
     /// OS interface index (used on Windows).
     pub ifindex: u32,
-    /// Interface name (used on Unix for SO_BINDTODEVICE).
-    #[allow(dead_code)]
+    /// Interface name (used on Unix for SO_BINDTODEVICE, and to scope the
+    /// kill switch).
     pub device: String,
     /// The uplink's own IPv4 address — the source-address pin. `None` degrades
     /// to interface-pin-only (replies may not return under a hijacked route).
@@ -127,24 +127,6 @@ pub async fn bind_udp(dst: SocketAddr, pin: &EgressPin) -> io::Result<UdpSocket>
     UdpSocket::from_std(std::net::UdpSocket::from(sock))
 }
 
-/// Bind a UDP socket to a FIXED local port on the pinned egress interface,
-/// sourced from the uplink's own address. `port == 0` → ephemeral. This is the
-/// file channel's bind: a listener must own its port on the real uplink IP, and
-/// replies must leave the uplink — not fall into a hijacked default route and
-/// ride the exit. The source-pin is what keeps the 5-tuple on the uplink; the
-/// mark (applied by bind_to_interface on unix) is what the kill switch permits.
-pub async fn bind_udp_local(port: u16, pin: &EgressPin) -> io::Result<UdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    bind_to_interface(&sock, pin, true)?; // interface pin (+ SO_MARK on unix)
-    let local = match pin.src {
-        Some(IpAddr::V4(v4)) => SocketAddr::new(IpAddr::V4(v4), port),
-        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), // degrade: iface-pin only
-    };
-    sock.bind(&local.into())?;
-    sock.set_nonblocking(true)?;
-    UdpSocket::from_std(std::net::UdpSocket::from(sock))
-}
-
 /// The source-address half of the pin (see module docs). IPv4 only, mirroring
 /// the engine's IPv4-only capture; a `None` source is a no-op (wildcard, as
 /// before — interface pin still applies).
@@ -181,9 +163,8 @@ pub fn probe_source_ip(probe: Ipv4Addr, pin: &EgressPin) -> io::Result<Ipv4Addr>
 /// gateway (needed to keep the encrypted tunnel's own route reachable during a
 /// full-tunnel hijack). MUST run before the default route is hijacked. Never
 /// fails: a discovery error degrades to an unpinned egress (outbound sockets
-/// then follow the routing table) — logged loudly, the same fallback the engine
-/// used when this logic lived inline. Called once in `main` and shared by both
-/// the engine and the file channel, so they cannot disagree on the uplink.
+/// then follow the routing table) — logged loudly. Called once in `main`, so the
+/// exit and the kill switch cannot disagree on which interface is the uplink.
 pub fn discover_egress() -> (EgressPin, String) {
     match crate::route::discover_uplink() {
         Ok((src, iface_id, gw)) => {

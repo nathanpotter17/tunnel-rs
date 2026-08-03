@@ -1,22 +1,26 @@
-# tunnel settings. Copy to tunnel.toml (or pass with -c).
+# tunnel settings. Copy to tunnel.toml (or pass with -s / as a positional).
 # All fields are optional; the defaults below are built in.
 
 tun_ip = "198.18.0.1"   # our address on the TUN (RFC 2544 range, avoids LAN clashes)
 tun_prefix = 15
 mtu = 1400
-dns = "1.1.1.1"         # forced onto the TUN while full-tunnel is active, so DNS
-                        # travels through the tunnel (no leak). Set to Proton's DNS
-                        # or any public resolver reachable via your exit.
+dns = "1.1.1.1"         # pinned onto the TUN while full-tunnel is active, so DNS
+                        # travels through the tunnel (no leak). Must be reachable
+                        # via your exit — Proton's is 10.2.0.1.
 
 # ---------------------------------------------------------------------------
 # Optional WireGuard exit (BYO VPN — e.g. ProtonVPN).
 #
-# When present, ALL tunneled traffic egresses through this WireGuard peer instead
-# of the host's uplink. This is how you get "Proton as the exit" WITHOUT running
-# the ProtonVPN app (whose kill switch would otherwise block us). Turn Proton's
-# app OFF and paste its WireGuard config values here.
+# When present, ALL tunneled traffic egresses through this WireGuard peer
+# instead of the host's uplink. This is how you get "Proton as the exit" WITHOUT
+# running the ProtonVPN app (whose kill switch would otherwise block us). Turn
+# Proton's app OFF and paste its WireGuard config values here.
 #
-# Get a config from Proton: Account → Downloads → WireGuard configuration.
+# This is a pure CLIENT config. The endpoint socket is outbound-initiated from
+# an ephemeral port and held open by persistent_keepalive, so NO port forwarding
+# is required on your router or from your VPN provider.
+#
+# Get a config from Proton: Account -> Downloads -> WireGuard configuration.
 # Map the .conf fields:
 #   [Interface] PrivateKey  -> private_key
 #   [Interface] Address     -> address   (drop the "/32")
@@ -32,7 +36,9 @@ dns = "1.1.1.1"         # forced onto the TUN while full-tunnel is active, so DN
 # preshared_key = "CCCC...=="        # optional
 # persistent_keepalive = 25
 
-# DNS: handled automatically. While full-tunnel is active the tool pins the TUN's
-# DNS to `dns` above (default 1.1.1.1) and prefers that interface, so lookups go
-# through the tunnel — no manual system-DNS change needed. Change `dns` if you
-# want a different resolver (must be reachable via your exit).
+# DNS: handled automatically. While full-tunnel is active the engine pins the
+# TUN's resolver to `dns` above and makes it the DEFAULT DNS route (systemd-
+# resolved `~.`, or /etc/resolv.conf on hosts without resolved), then restores
+# the previous configuration on exit. This is mandatory under capture: the kill
+# switch drops unmarked traffic out the uplink, which includes queries to a LAN
+# resolver.

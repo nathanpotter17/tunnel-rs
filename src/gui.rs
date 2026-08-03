@@ -1,16 +1,12 @@
-//! Provides a cross-platform GUI for managing tunnel connections,
-//! file sharing, and viewing session logs.
+//! Live dashboard for the egress engine: status, traffic observability, log.
 
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::file_transfer::FileTransferManager;
 use crate::inspect::TrafficSnapshot;
 use crate::state::Shared;
-use crate::file_session::{FileAction, FileHandle};
 
 /// Map the engine's log-level string into the GUI enum.
 fn map_level(level: &str) -> LogLevel {
@@ -144,42 +140,18 @@ fn apply_theme(ctx: &egui::Context, theme: &Theme) {
 /// Shared state between engine and GUI (view model).
 #[derive(Default)]
 pub struct AppState {
-    pub sessions: Vec<SessionInfo>,
     pub logs: VecDeque<LogEntry>,
-    pub shared_files: Vec<SharedFile>,
-    pub remote_files: Vec<RemoteFile>,
     pub status: Status,
-    pub transfer: Option<TransferProgress>,
-    pub pending_actions: Vec<GuiAction>,
-    /// Pending file transfer requests awaiting user approval
-    pub pending_transfers: Vec<PendingTransferInfo>,
     /// Live traffic observability snapshot (throughput, flows, protocols).
     pub traffic: TrafficSnapshot,
-}
-
-/// Info about a pending transfer shown in the GUI
-#[derive(Clone)]
-pub struct PendingTransferInfo {
-    pub request_id: u32,
-    pub direction: String,
-    pub file_name: String,
-    pub file_size: u64,
-    pub file_type: String,
 }
 
 #[derive(Clone, Default)]
 pub struct Status {
     pub running: bool,
-    pub listen_addr: String,
+    /// e.g. "WireGuard → 1.2.3.4:51820" or "Direct (uplink)".
+    pub exit: String,
     pub started_at: Option<Instant>,
-}
-
-#[derive(Clone)]
-pub struct SessionInfo {
-    pub peer_addr: String,
-    pub tun_ip: String,
-    pub bytes_transferred: u64,
-    pub connected_at: Instant,
 }
 
 #[derive(Clone)]
@@ -197,77 +169,11 @@ pub enum LogLevel {
     Error,
 }
 
-#[derive(Clone)]
-pub struct SharedFile {
-    pub name: String,
-    #[allow(dead_code)]
-    pub path: PathBuf,
-    pub size: u64,
-    pub file_type: FileType,
-}
-
-#[derive(Clone)]
-pub struct RemoteFile {
-    pub name: String,
-    pub size: u64,
-    pub file_type: String,
-}
-
-#[derive(Clone)]
-pub struct TransferProgress {
-    pub file_name: String,
-    pub progress: f32,
-    pub is_upload: bool,
-    #[allow(dead_code)]
-    pub started_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-pub enum GuiAction {
-    ShareFile(PathBuf),
-    UnshareFile(String),
-    RequestFileList,
-    DownloadFile(String),
-    ApproveTransfer(u32),
-    DenyTransfer(u32),
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum FileType {
-    Image,
-    Video,
-    Text,
-    Pdf,
-    Other,
-}
-
-impl FileType {
-    pub fn from_extension(ext: &str) -> Self {
-        match ext.to_lowercase().as_str() {
-            "png" | "jpg" | "jpeg" | "gif" | "webp" => FileType::Image,
-            "mp4" | "webm" | "mov" | "avi" | "mkv" => FileType::Video,
-            "txt" | "md" | "rs" | "toml" | "json" | "yaml" => FileType::Text,
-            "pdf" => FileType::Pdf,
-            _ => FileType::Other,
-        }
-    }
-
-    pub fn icon(&self) -> &'static str {
-        match self {
-            FileType::Image => "IMG",
-            FileType::Video => "VID",
-            FileType::Text => "TXT",
-            FileType::Pdf => "PDF",
-            FileType::Other => "---",
-        }
-    }
-}
-
 impl AppState {
+    #[allow(dead_code)]
     pub fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
-        let now = chrono::Local::now();
         self.logs.push_back(LogEntry {
-            timestamp: now.format("%H:%M:%S").to_string(),
+            timestamp: String::new(),
             level,
             message: message.into(),
         });
@@ -276,76 +182,14 @@ impl AppState {
         }
     }
 
-    pub fn add_shared_file(&mut self, path: PathBuf) -> std::io::Result<()> {
-        let metadata = std::fs::metadata(&path)?;
-        let name = path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let ext = path.extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        if self.shared_files.iter().any(|f| f.name == name) {
-            return Ok(());
-        }
-
-        self.shared_files.push(SharedFile {
-            name: name.clone(),
-            path: path.clone(),
-            size: metadata.len(),
-            file_type: FileType::from_extension(&ext),
-        });
-
-        self.pending_actions.push(GuiAction::ShareFile(path));
-        self.push_log(LogLevel::Info, format!("+ {}", name));
-        Ok(())
-    }
-
-    pub fn remove_shared_file(&mut self, name: &str) {
-        self.shared_files.retain(|f| f.name != name);
-        self.pending_actions.push(GuiAction::UnshareFile(name.to_string()));
-        self.push_log(LogLevel::Info, format!("- {}", name));
-    }
-
-    pub fn request_file_list(&mut self) {
-        self.pending_actions.push(GuiAction::RequestFileList);
-        self.push_log(LogLevel::Debug, "requesting file list");
-    }
-
-    pub fn download_file(&mut self, name: &str) {
-        self.pending_actions.push(GuiAction::DownloadFile(name.to_string()));
-        self.push_log(LogLevel::Info, format!("download: {}", name));
-    }
-
-    pub fn approve_transfer(&mut self, request_id: u32) {
-        self.pending_actions.push(GuiAction::ApproveTransfer(request_id));
-        self.pending_transfers.retain(|t| t.request_id != request_id);
-        self.push_log(LogLevel::Info, format!("approved transfer #{}", request_id));
-    }
-
-    pub fn deny_transfer(&mut self, request_id: u32) {
-        self.pending_actions.push(GuiAction::DenyTransfer(request_id));
-        self.pending_transfers.retain(|t| t.request_id != request_id);
-        self.push_log(LogLevel::Info, format!("denied transfer #{}", request_id));
-    }
-
-    pub fn take_pending_actions(&mut self) -> Vec<GuiAction> {
-        std::mem::take(&mut self.pending_actions)
-    }
-
     pub fn clear_logs(&mut self) {
         self.logs.clear();
     }
 }
 
-// ============================================================================
-// Application
-// ============================================================================
-
 pub struct TunnelApp {
     state: Arc<Mutex<AppState>>,
     shared: Arc<Shared>,
-    files: Option<FileHandle>,
     theme: Theme,
     show_debug_logs: bool,
     auto_scroll: bool,
@@ -354,11 +198,10 @@ pub struct TunnelApp {
 }
 
 impl TunnelApp {
-    pub fn new(shared: Arc<Shared>, files: Option<FileHandle>) -> Self {
+    pub fn new(shared: Arc<Shared>) -> Self {
         Self {
             state: Arc::new(Mutex::new(AppState::default())),
             shared,
-            files,
             theme: Theme::default(),
             show_debug_logs: false,
             auto_scroll: true,
@@ -367,46 +210,23 @@ impl TunnelApp {
         }
     }
 
-    pub fn run(shared: Arc<Shared>, files: Option<FileHandle>) -> eframe::Result<()> {
+    pub fn run(shared: Arc<Shared>) -> eframe::Result<()> {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1000.0, 700.0])
-                .with_min_inner_size([800.0, 600.0])
-                .with_drag_and_drop(true),
+                .with_min_inner_size([800.0, 600.0]),
             ..Default::default()
         };
 
         eframe::run_native(
             "Quorum IO - VPN v1.0",
             options,
-            Box::new(move |_cc| Ok(Box::new(TunnelApp::new(shared, files)))),
+            Box::new(move |_cc| Ok(Box::new(TunnelApp::new(shared)))),
         )
     }
 
-    /// Copy engine + file-channel state into the view model, and forward any
-    /// queued UI actions to the file channel. Called once per frame.
+    /// Copy engine state into the view model. Called once per frame.
     fn sync_from_engine(&mut self) {
-        // Forward last frame's queued actions to the channel.
-        let actions = if let Ok(mut s) = self.state.lock() {
-            s.take_pending_actions()
-        } else {
-            Vec::new()
-        };
-        for a in actions {
-            let fa = match a {
-                GuiAction::ShareFile(p) => FileAction::Share(p),
-                GuiAction::UnshareFile(n) => FileAction::Unshare(n),
-                GuiAction::RequestFileList => FileAction::RequestList,
-                GuiAction::DownloadFile(n) => FileAction::Download(n),
-                GuiAction::ApproveTransfer(id) => FileAction::Approve(id),
-                GuiAction::DenyTransfer(id) => FileAction::Deny(id),
-            };
-            if let Some(files) = &self.files {
-                let _ = files.actions.try_send(fa);
-            }
-        }
-
-        // Snapshot engine truth.
         let traffic = self.shared.monitor.snapshot();
         let (running, exit, started_at) = if let Ok(st) = self.shared.status.lock() {
             (st.running, st.exit.clone(), st.started_at)
@@ -418,58 +238,19 @@ impl TunnelApp {
         } else {
             Vec::new()
         };
-        let view = self
-            .files
-            .as_ref()
-            .and_then(|f| f.view.lock().ok().map(|v| v.clone()));
 
         if let Ok(mut s) = self.state.lock() {
             s.status.running = running;
-            s.status.listen_addr = exit.clone();
+            s.status.exit = exit;
             s.status.started_at = started_at;
             s.traffic = traffic;
 
-            // Rebuild the console ring from the unified engine log.
+            // Rebuild the console ring from the unified engine log — the engine
+            // is the single source of truth, so the view is regenerated rather
+            // than appended to.
             s.logs.clear();
             for (level, message) in logs {
                 s.logs.push_back(LogEntry { timestamp: String::new(), level, message });
-            }
-
-            if let Some(v) = view {
-                s.sessions = if v.connected {
-                    vec![SessionInfo {
-                        peer_addr: v.peer.map(|p| p.to_string()).unwrap_or_else(|| "peer".into()),
-                        tun_ip: exit,
-                        bytes_transferred: 0,
-                        connected_at: started_at.unwrap_or_else(Instant::now),
-                    }]
-                } else {
-                    Vec::new()
-                };
-                s.shared_files = v.shared.iter().map(|f| SharedFile {
-                    name: f.name.clone(),
-                    path: PathBuf::new(),
-                    size: f.size,
-                    file_type: FileType::from_extension(&f.file_type),
-                }).collect();
-                s.remote_files = v.remote.iter().map(|f| RemoteFile {
-                    name: f.name.clone(),
-                    size: f.size,
-                    file_type: f.file_type.clone(),
-                }).collect();
-                s.pending_transfers = v.pending.iter().map(|p| PendingTransferInfo {
-                    request_id: p.id,
-                    direction: p.direction.to_string(),
-                    file_name: p.file_name.clone(),
-                    file_size: p.file_size,
-                    file_type: p.file_type.clone(),
-                }).collect();
-                s.transfer = v.transfer.as_ref().map(|(n, prog, up)| TransferProgress {
-                    file_name: n.clone(),
-                    progress: *prog,
-                    is_upload: *up,
-                    started_at: Instant::now(),
-                });
             }
         }
     }
@@ -517,64 +298,22 @@ impl eframe::App for TunnelApp {
             .show(ctx, |ui| {
                 let mut state = state_arc.lock().unwrap();
 
-                // Pending transfer approvals (prominent banner)
-                if !state.pending_transfers.is_empty() {
-                    render_pending_approvals(ui, &mut state, theme);
-                    ui.add_space(8.0);
-                }
-
-                // Transfer progress bar (if active)
-                if state.transfer.is_some() {
-                    render_transfer(ui, &state, theme);
-                    ui.add_space(8.0);
-                }
-
-                // Main grid layout
-                // Top row: Sessions | Local Files | Remote Files
-                // Bottom row: Console (full width)
-
+                // Two stacked regions: the traffic dashboard and the console.
+                // The console takes whatever remains AT RENDER TIME so it meets
+                // the window bottom exactly — a precomputed residual drifts from
+                // egui's actual layout (implicit item spacing between widgets)
+                // and leaves a gap.
                 let available = ui.available_size();
                 let spacing = 8.0;
-
-                // Calculate column width so 3 panels + 2 gaps = total width
                 let total_width = available.x;
-                let col_width = (total_width - spacing * 2.0) / 3.0;
+                let traffic_height = (available.y * 0.62).max(280.0);
 
-                // Three stacked regions: status row, traffic dashboard, console.
-                // Only the first two are precomputed; the console takes whatever
-                // remains AT RENDER TIME, so it meets the window bottom exactly —
-                // a precomputed residual drifts from egui's actual layout (implicit
-                // item spacing between widgets) and leaves a gap.
-                let top_height = (available.y * 0.24).max(130.0);
-                let traffic_height = (available.y * 0.46).max(240.0);
-
-                // Row 1 - Sessions | Local | Remote
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = spacing;
-
-                    render_panel(ui, "SESSIONS", col_width, top_height, theme, |ui| {
-                        render_sessions(ui, &state, theme);
-                    });
-
-                    render_panel(ui, "LOCAL", col_width, top_height, theme, |ui| {
-                        render_local_files(ui, &mut state, theme);
-                    });
-
-                    render_panel(ui, "REMOTE", col_width, top_height, theme, |ui| {
-                        render_remote_files(ui, &mut state, theme);
-                    });
-                });
-
-                ui.add_space(spacing);
-
-                // Row 2 - Traffic observability (full width)
                 render_panel(ui, "TRAFFIC", total_width, traffic_height, theme, |ui| {
                     render_traffic(ui, &state.traffic, theme);
                 });
 
                 ui.add_space(spacing);
 
-                // Row 3 - Console fills exactly to the window bottom.
                 let console_height = ui.available_height().max(110.0);
                 render_panel(ui, "LOG", total_width, console_height, theme, |ui| {
                     render_console(ui, &mut state, &mut show_debug_logs, &mut auto_scroll, &mut log_filter, theme);
@@ -666,15 +405,16 @@ fn render_header(ui: &mut egui::Ui, state: &AppState, theme: &Theme) {
             .size(10.0)
             .monospace());
 
-        if state.status.running && !state.status.listen_addr.is_empty() {
+        if state.status.running && !state.status.exit.is_empty() {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(&state.status.listen_addr)
+            ui.label(egui::RichText::new(&state.status.exit)
                 .color(theme.text_muted)
                 .size(10.0)
                 .monospace());
         }
 
-        // Right side: uptime
+        // Right side: uptime and session totals, read from the traffic monitor —
+        // the only remaining source of truth now the peer-session table is gone.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(started) = state.status.started_at {
                 ui.label(egui::RichText::new(format_duration(started.elapsed()))
@@ -683,334 +423,16 @@ fn render_header(ui: &mut egui::Ui, state: &AppState, theme: &Theme) {
                     .monospace());
             }
 
-            // Stats
-            let total_bytes: u64 = state.sessions.iter().map(|s| s.bytes_transferred).sum();
-            if total_bytes > 0 {
+            let total = state.traffic.total_up + state.traffic.total_down;
+            if total > 0 {
                 ui.add_space(16.0);
-                ui.label(egui::RichText::new(format_bytes(total_bytes))
+                ui.label(egui::RichText::new(format_bytes(total))
                     .color(theme.text_secondary)
                     .size(10.0)
                     .monospace());
             }
         });
     });
-}
-
-fn render_pending_approvals(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
-    for i in 0..state.pending_transfers.len() {
-        let transfer = &state.pending_transfers[i];
-        let request_id = transfer.request_id;
-        let direction = transfer.direction.clone();
-        let file_name = transfer.file_name.clone();
-        let file_size = transfer.file_size;
-
-        egui::Frame::none()
-            .fill(theme.surface)
-            .stroke(Stroke::new(1.0, theme.warning))
-            .rounding(Rounding::same(2.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("[?]")
-                        .color(theme.warning)
-                        .size(11.0)
-                        .monospace()
-                        .strong());
-
-                    ui.label(egui::RichText::new(format!(
-                        "Peer wants to {} \"{}\" ({})",
-                        direction, file_name, format_bytes_short(file_size)
-                    ))
-                        .color(theme.text_primary)
-                        .size(11.0)
-                        .monospace());
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let deny_btn = egui::Button::new(
-                            egui::RichText::new("DENY")
-                                .color(theme.error)
-                                .size(10.0)
-                                .monospace()
-                        )
-                        .fill(theme.background)
-                        .stroke(Stroke::new(1.0, theme.error))
-                        .rounding(Rounding::same(2.0));
-
-                        if ui.add(deny_btn).clicked() {
-                            state.deny_transfer(request_id);
-                        }
-
-                        ui.add_space(4.0);
-
-                        let approve_btn = egui::Button::new(
-                            egui::RichText::new("ALLOW")
-                                .color(theme.success)
-                                .size(10.0)
-                                .monospace()
-                        )
-                        .fill(theme.background)
-                        .stroke(Stroke::new(1.0, theme.success))
-                        .rounding(Rounding::same(2.0));
-
-                        if ui.add(approve_btn).clicked() {
-                            state.approve_transfer(request_id);
-                        }
-                    });
-                });
-            });
-        ui.add_space(4.0);
-    }
-}
-
-fn render_transfer(ui: &mut egui::Ui, state: &AppState, theme: &Theme) {
-    if let Some(ref transfer) = state.transfer {
-        egui::Frame::none()
-            .fill(theme.surface)
-            .stroke(Stroke::new(1.0, theme.border))
-            .rounding(Rounding::same(2.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let direction = if transfer.is_upload { "UP" } else { "DN" };
-                    ui.label(egui::RichText::new(direction)
-                        .color(theme.text_muted)
-                        .size(10.0)
-                        .monospace());
-
-                    ui.label(egui::RichText::new(&transfer.file_name)
-                        .color(theme.text_secondary)
-                        .size(11.0)
-                        .monospace());
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(format!("{:.0}%", transfer.progress))
-                            .color(theme.text_primary)
-                            .size(11.0)
-                            .monospace());
-
-                        // Progress bar
-                        let available_width = ui.available_width().min(200.0);
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::new(available_width, 4.0),
-                            egui::Sense::hover(),
-                        );
-
-                        // Background
-                        ui.painter().rect_filled(rect, 2.0, theme.border);
-
-                        // Fill
-                        let fill_width = rect.width() * (transfer.progress / 100.0);
-                        let fill_rect = egui::Rect::from_min_size(
-                            rect.min,
-                            Vec2::new(fill_width, rect.height()),
-                        );
-                        ui.painter().rect_filled(fill_rect, 2.0, theme.text_secondary);
-                    });
-                });
-            });
-    }
-}
-
-fn render_sessions(ui: &mut egui::Ui, state: &AppState, theme: &Theme) {
-    if state.sessions.is_empty() {
-        ui.vertical_centered(|ui| {
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new("no active sessions")
-                .color(theme.text_muted)
-                .size(11.0)
-                .monospace());
-        });
-    } else {
-        egui::ScrollArea::vertical()
-            .id_salt("sessions_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for session in &state.sessions {
-                    egui::Frame::none()
-                        .fill(theme.background)
-                        .rounding(Rounding::same(2.0))
-                        .inner_margin(egui::Margin::same(8.0))
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&session.peer_addr)
-                                    .color(theme.text_primary)
-                                    .size(11.0)
-                                    .monospace());
-
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(&session.tun_ip)
-                                        .color(theme.text_muted)
-                                        .size(10.0)
-                                        .monospace());
-
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new(format_bytes(session.bytes_transferred))
-                                            .color(theme.text_secondary)
-                                            .size(10.0)
-                                            .monospace());
-                                    });
-                                });
-                            });
-                        });
-                    ui.add_space(4.0);
-                }
-            });
-    }
-}
-
-fn render_local_files(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
-    // Toolbar
-    ui.horizontal(|ui| {
-        if mono_button(ui, "+ ADD", theme).clicked() {
-            if let Some(paths) = rfd::FileDialog::new()
-                .set_title("Select files")
-                .pick_files()
-            {
-                for path in paths {
-                    let _ = state.add_shared_file(path);
-                }
-            }
-        }
-
-        if mono_button(ui, "FOLDER", theme).clicked() {
-            if let Some(folder) = rfd::FileDialog::new()
-                .set_title("Select folder")
-                .pick_folder()
-            {
-                if let Ok(entries) = std::fs::read_dir(&folder) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            let _ = state.add_shared_file(path);
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    ui.add_space(8.0);
-
-    // File list
-    if state.shared_files.is_empty() {
-        ui.label(egui::RichText::new("no files shared")
-            .color(theme.text_muted)
-            .size(10.0)
-            .monospace());
-    } else {
-        egui::ScrollArea::vertical()
-            .id_salt("local_files_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut to_remove = None;
-
-                for file in &state.shared_files {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(file.file_type.icon())
-                            .color(theme.text_muted)
-                            .size(9.0)
-                            .monospace());
-
-                        ui.label(egui::RichText::new(&file.name)
-                            .color(theme.text_secondary)
-                            .size(10.0)
-                            .monospace());
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Label::new(
-                                egui::RichText::new("×")
-                                    .color(theme.text_muted)
-                                    .size(12.0)
-                            ).sense(egui::Sense::click())).clicked() {
-                                to_remove = Some(file.name.clone());
-                            }
-
-                            ui.label(egui::RichText::new(format_bytes_short(file.size))
-                                .color(theme.text_muted)
-                                .size(9.0)
-                                .monospace());
-                        });
-                    });
-                }
-
-                if let Some(name) = to_remove {
-                    state.remove_shared_file(&name);
-                }
-            });
-    }
-}
-
-fn render_remote_files(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
-    // Toolbar
-    ui.horizontal(|ui| {
-        if mono_button(ui, "REFRESH", theme).clicked() {
-            state.request_file_list();
-        }
-
-        if mono_button(ui, "OPEN DIR", theme).clicked() {
-            let download_dir = FileTransferManager::default_download_dir();
-            let _ = std::fs::create_dir_all(&download_dir);
-            let _ = open::that(&download_dir);
-        }
-    });
-
-    ui.add_space(8.0);
-
-    // File list
-    if state.remote_files.is_empty() {
-        ui.label(egui::RichText::new("no remote files")
-            .color(theme.text_muted)
-            .size(10.0)
-            .monospace());
-    } else {
-        egui::ScrollArea::vertical()
-            .id_salt("remote_files_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut download_file = None;
-
-                for file in &state.remote_files {
-                    ui.horizontal(|ui| {
-                        let icon = match file.file_type.as_str() {
-                            "png" | "jpg" | "jpeg" | "gif" | "webp" => "IMG",
-                            "mp4" | "mov" | "webm" | "avi" => "VID",
-                            "txt" | "md" | "rs" | "toml" => "TXT",
-                            "pdf" => "PDF",
-                            _ => "---",
-                        };
-
-                        ui.label(egui::RichText::new(icon)
-                            .color(theme.text_muted)
-                            .size(9.0)
-                            .monospace());
-
-                        ui.label(egui::RichText::new(&file.name)
-                            .color(theme.text_secondary)
-                            .size(10.0)
-                            .monospace());
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Label::new(
-                                egui::RichText::new("Download")
-                                    .color(theme.text_secondary)
-                                    .size(11.0)
-                            ).sense(egui::Sense::click())).clicked() {
-                                download_file = Some(file.name.clone());
-                            }
-
-                            ui.label(egui::RichText::new(format_bytes_short(file.size))
-                                .color(theme.text_muted)
-                                .size(9.0)
-                                .monospace());
-                        });
-                    });
-                }
-
-                if let Some(name) = download_file {
-                    state.download_file(&name);
-                }
-            });
-    }
 }
 
 fn render_console(

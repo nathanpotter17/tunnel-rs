@@ -1,17 +1,15 @@
-//! Minimal P0 configuration.
+//! Engine configuration — one TOML file.
 //!
-//! P0 has no routing rules or outbounds to configure yet — just the TUN address
-//! (default in the RFC 2544 benchmarking range to avoid colliding with home/office
-//! LANs) and the MTU. Loaded from a TOML file if present, otherwise defaults.
+//! The TUN address (default in the RFC 2544 benchmarking range to avoid
+//! colliding with home/office LANs), the MTU, the resolver pinned to the tunnel
+//! under full capture, and an optional WireGuard exit. Loaded from a TOML file
+//! if present, otherwise defaults.
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use tracing::{info, warn};
-
-use crate::crypto;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -28,34 +26,6 @@ pub struct Settings {
     /// Optional WireGuard exit (BYO, e.g. Proton). When present, all traffic
     /// egresses through it; otherwise it goes out the host's uplink (Direct).
     pub wireguard: Option<WgSettings>,
-    /// Optional file-sharing identity. Absent → the engine runs normally and
-    /// file sharing is OFF. Create one with `tunnel.exe keygen` and paste the
-    /// printed `[identity]` section into this file.
-    pub identity: Option<Identity>,
-}
-
-/// The file-sharing identity: a static X25519 private key. Only the encrypted
-/// file channel needs it — the VPN engine does not.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Identity {
-    /// Base64 X25519 private key, as printed by `tunnel.exe keygen`.
-    pub private_key: String,
-}
-
-impl Identity {
-    pub fn private_key_bytes(&self) -> Result<[u8; 32]> {
-        let bytes = BASE64
-            .decode(&self.private_key)
-            .context("invalid base64 in [identity] private_key")?;
-        bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("[identity] private_key must decode to 32 bytes"))
-    }
-
-    pub fn public_key(&self) -> Result<String> {
-        Ok(crypto::Keypair::from_private(self.private_key_bytes()?).public_key_base64())
-    }
 }
 
 /// A WireGuard peer (wg-quick fields). Keys are base64 as in `.conf` files.
@@ -92,7 +62,6 @@ impl Default for Settings {
             mtu: 1400,
             dns: Ipv4Addr::new(1, 1, 1, 1),
             wireguard: None,
-            identity: None,
         }
     }
 }
@@ -116,7 +85,7 @@ impl Settings {
         let s: Self = toml::from_str(&content)
             .with_context(|| format!("failed to parse settings: {}", path.display()))?;
         info!(
-            "settings loaded from {} — exit: {}, dns: {}, mtu: {}, tun: {}/{}, file sharing: {}",
+            "settings loaded from {} — exit: {}, dns: {}, mtu: {}, tun: {}/{}",
             path.display(),
             match &s.wireguard {
                 Some(wg) => format!("WireGuard → {}", wg.endpoint),
@@ -126,37 +95,29 @@ impl Settings {
             s.mtu,
             s.tun_ip,
             s.tun_prefix,
-            if s.identity.is_some() { "on" } else { "off (no [identity])" },
         );
         Ok(s)
     }
 }
 
-/// Write a starter settings file with a fresh file-sharing identity, the
-/// engine defaults spelled out, and a commented [wireguard] template.
-/// Refuses to overwrite an existing file.
+/// Write a starter settings file with the engine defaults spelled out and a
+/// commented [wireguard] template. Refuses to overwrite an existing file.
 pub fn init_config(path: &Path) -> Result<()> {
     if path.exists() {
         anyhow::bail!("settings file already exists at {}", path.display());
     }
-    let keypair = crypto::Keypair::generate()?;
-    let content = format!(
-        r#"# tunnel settings — one file for everything.
+    let content = r#"# tunnel settings — one file for everything.
 
 tun_ip = "198.18.0.1"   # our address on the TUN (RFC 2544 range, avoids LAN clashes)
 tun_prefix = 15
 mtu = 1400
-dns = "1.1.1.1"         # resolver forced onto the TUN under full-tunnel; must be
+dns = "1.1.1.1"         # resolver pinned to the TUN under full-tunnel; must be
                         # reachable via your exit (Proton's is 10.2.0.1)
 
-# File-sharing identity (generated for you). Delete this section to disable
-# file sharing; regenerate with `tunnel.exe keygen`.
-[identity]
-private_key = "{}"
-# your public key (share with peers): {}
-
-# Optional WireGuard exit (BYO VPN, e.g. ProtonVPN). Uncomment and fill in
-# from your provider's WireGuard .conf:
+# Optional WireGuard exit (BYO VPN, e.g. ProtonVPN). Uncomment and fill in from
+# your provider's WireGuard .conf. It is a pure CLIENT config: the endpoint
+# socket is outbound-initiated from an ephemeral port, so NO router port
+# forwarding is required on your side.
 #   [Interface] PrivateKey   -> private_key
 #   [Interface] Address      -> address (drop the "/32")
 #   [Peer]      PublicKey    -> public_key
@@ -169,10 +130,7 @@ private_key = "{}"
 # address     = "10.2.0.2"
 # preshared_key = "CCCC...=="
 # persistent_keepalive = 25
-"#,
-        keypair.private_key_base64(),
-        keypair.public_key_base64(),
-    );
+"#;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -180,6 +138,5 @@ private_key = "{}"
     }
     std::fs::write(path, content)?;
     println!("Settings created at: {}", path.display());
-    println!("Your public key: {}", keypair.public_key_base64());
     Ok(())
 }
