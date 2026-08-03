@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Number of throughput samples retained for the live graph (~2 minutes at 1s).
@@ -563,6 +563,16 @@ impl Inner {
 /// (it's an `Arc` at the call sites) and safe to feed from multiple tasks.
 pub struct TrafficMonitor {
     inner: Mutex<Inner>,
+    /// Last rendered view, rebuilt once per `tick` and handed out by reference.
+    ///
+    /// The dashboard repaints at frame rate, but everything it shows advances at
+    /// tick rate — the series, the per-flow rates, the eviction sweep. Building a
+    /// fresh snapshot per frame would allocate a few hundred `String`s *while
+    /// holding the same lock the per-packet path takes*, turning the render loop
+    /// into a throughput tax. Publishing one `Arc` per tick makes a read O(1) and
+    /// lock-disjoint from `record`, and costs nothing in freshness: a value that
+    /// only changes at 1 Hz cannot be shown more often than that anyway.
+    cache: Mutex<Arc<TrafficSnapshot>>,
 }
 
 impl Default for TrafficMonitor {
@@ -575,6 +585,7 @@ impl TrafficMonitor {
     pub fn new() -> Self {
         TrafficMonitor {
             inner: Mutex::new(Inner::new(Instant::now())),
+            cache: Mutex::new(Arc::new(TrafficSnapshot::default())),
         }
     }
 
@@ -706,6 +717,14 @@ impl TrafficMonitor {
             f.rate = (total.saturating_sub(f.last_total)) as f64 / dt;
             f.last_total = total;
         }
+
+        // Publish the view while the lock is already held: one build per tick,
+        // shared by every reader until the next one.
+        let view = Arc::new(build_snapshot(&inner, now));
+        drop(inner);
+        if let Ok(mut c) = self.cache.lock() {
+            *c = view;
+        }
     }
 
     /// Tag a flow with an engine admission-control status so the dashboard and
@@ -775,48 +794,54 @@ impl TrafficMonitor {
         Ok(records.len())
     }
 
-    /// Produce a snapshot for the GUI.
-    pub fn snapshot(&self) -> TrafficSnapshot {
-        let inner = self.inner.lock().unwrap();
-        let now = Instant::now();
-
-        let mut flows: Vec<FlowRow> = inner
-            .flows
-            .iter()
-            .map(|(k, f)| FlowRow {
-                remote: fmt_endpoint(k.remote_ip, k.remote_port),
-                proto: k.l4,
-                app: f.app.label(),
-                up: f.up,
-                down: f.down,
-                rate: f.rate,
-                idle_ms: now.duration_since(f.last_seen).as_millis() as u64,
-                status: f.status.label(),
-            })
-            .collect();
-        flows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
-        flows.truncate(MAX_FLOWS);
-
-        let mut protos: Vec<(String, u64)> = inner
-            .proto_bytes
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect();
-        protos.sort_by(|a, b| b.1.cmp(&a.1));
-
-        TrafficSnapshot {
-            total_up: inner.total_up,
-            total_down: inner.total_down,
-            pkts_up: inner.pkts_up,
-            pkts_down: inner.pkts_down,
-            rate_up: inner.up_series.back().copied().unwrap_or(0.0),
-            rate_down: inner.down_series.back().copied().unwrap_or(0.0),
-            up_series: inner.up_series.iter().copied().collect(),
-            down_series: inner.down_series.iter().copied().collect(),
-            active_flows: inner.flows.len(),
-            flows,
-            protos,
+    /// The current view, as published by the last `tick`. O(1): an `Arc` clone.
+    pub fn snapshot(&self) -> Arc<TrafficSnapshot> {
+        match self.cache.lock() {
+            Ok(c) => c.clone(),
+            Err(e) => e.into_inner().clone(),
         }
+    }
+}
+
+/// Render `Inner` into the immutable view the dashboard draws from. Called once
+/// per tick, with the monitor lock already held.
+fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
+    let mut flows: Vec<FlowRow> = inner
+        .flows
+        .iter()
+        .map(|(k, f)| FlowRow {
+            remote: fmt_endpoint(k.remote_ip, k.remote_port),
+            proto: k.l4,
+            app: f.app.label(),
+            up: f.up,
+            down: f.down,
+            rate: f.rate,
+            idle_ms: now.duration_since(f.last_seen).as_millis() as u64,
+            status: f.status.label(),
+        })
+        .collect();
+    flows.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
+    flows.truncate(MAX_FLOWS);
+
+    let mut protos: Vec<(String, u64)> = inner
+        .proto_bytes
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+    protos.sort_by(|a, b| b.1.cmp(&a.1));
+
+    TrafficSnapshot {
+        total_up: inner.total_up,
+        total_down: inner.total_down,
+        pkts_up: inner.pkts_up,
+        pkts_down: inner.pkts_down,
+        rate_up: inner.up_series.back().copied().unwrap_or(0.0),
+        rate_down: inner.down_series.back().copied().unwrap_or(0.0),
+        up_series: inner.up_series.iter().copied().collect(),
+        down_series: inner.down_series.iter().copied().collect(),
+        active_flows: inner.flows.len(),
+        flows,
+        protos,
     }
 }
 
@@ -913,12 +938,14 @@ mod tests {
         // flow label must not fall back.
         let p2 = v4_udp([10, 0, 0, 2], [5, 6, 7, 8], 40001, 40002, &[0, 0]);
         m.record(Direction::Up, &p2);
+        m.tick();
         assert_eq!(m.snapshot().flows[0].app, "Obfuscated");
         // Payload signature on the same flow upgrades it.
         let mut wg = vec![0u8; 148];
         wg[0] = 1;
         let p3 = v4_udp([10, 0, 0, 2], [5, 6, 7, 8], 40001, 40002, &wg);
         m.record(Direction::Up, &p3);
+        m.tick();
         let snap = m.snapshot();
         assert_eq!(snap.flows[0].app, "WireGuard");
         // Protocol byte totals were reattributed to the final identity.
@@ -978,6 +1005,7 @@ mod tests {
     fn ignores_garbage() {
         let m = TrafficMonitor::new();
         m.record(Direction::Up, &[0xff, 0x00]);
+        m.tick();
         let snap = m.snapshot();
         assert_eq!(snap.total_up, 0);
     }

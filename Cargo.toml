@@ -7,12 +7,10 @@ license = "BSD"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 base64 = "0.22"
 anyhow = "1"
-async-trait = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 boringtun = { version = "0.7", default-features = false }
 tracing = "0.1"
@@ -21,6 +19,10 @@ chrono = "0.4"
 smoltcp = { version = "0.12", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation",
     "socket-tcp", "socket-udp",
+    # Socket wakers. This is what makes dispatch readiness-driven instead of a
+    # full-table scan per wake (see conn.rs) — smoltcp only compiles
+    # register_recv_waker / register_send_waker under this feature.
+    "async",
 ] }
 
 # GUI (optional, enabled by default). No file dialogs remain, so rfd/open are
@@ -57,8 +59,5 @@ windows = { version = "0.59", features = [
 ] }
 
 [profile.release]
-opt-level = 2
 lto = true
 codegen-units = 1
-strip = true
-debug = false

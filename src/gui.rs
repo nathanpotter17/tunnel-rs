@@ -143,7 +143,9 @@ pub struct AppState {
     pub logs: VecDeque<LogEntry>,
     pub status: Status,
     /// Live traffic observability snapshot (throughput, flows, protocols).
-    pub traffic: TrafficSnapshot,
+    /// Shared by reference with the monitor: the engine publishes one per tick,
+    /// the dashboard borrows it for as many frames as it lasts.
+    pub traffic: Arc<TrafficSnapshot>,
 }
 
 #[derive(Clone, Default)]
@@ -195,6 +197,9 @@ pub struct TunnelApp {
     auto_scroll: bool,
     log_filter: String,
     theme_applied: bool,
+    /// Last log sequence copied into the view model. The engine bumps its
+    /// counter per line; frames that see no change skip rebuilding the ring.
+    log_seq: u64,
 }
 
 impl TunnelApp {
@@ -207,6 +212,7 @@ impl TunnelApp {
             auto_scroll: true,
             log_filter: String::new(),
             theme_applied: false,
+            log_seq: u64::MAX,
         }
     }
 
@@ -226,6 +232,12 @@ impl TunnelApp {
     }
 
     /// Copy engine state into the view model. Called once per frame.
+    ///
+    /// Traffic is an `Arc` clone, so the packet path is never blocked by a
+    /// repaint. The log is rebuilt only when the engine's sequence counter has
+    /// moved: regenerating five hundred `String`s ten times a second for a ring
+    /// that usually has not changed is pure waste, and it takes the same lock the
+    /// logger writes under.
     fn sync_from_engine(&mut self) {
         let traffic = self.shared.monitor.snapshot();
         let (running, exit, started_at) = if let Ok(st) = self.shared.status.lock() {
@@ -233,10 +245,17 @@ impl TunnelApp {
         } else {
             (false, String::new(), None)
         };
-        let logs: Vec<(LogLevel, String)> = if let Ok(l) = self.shared.logs.lock() {
-            l.iter().map(|line| (map_level(line.level), line.msg.clone())).collect()
+
+        let seq = self.shared.log_seq.load(std::sync::atomic::Ordering::Relaxed);
+        let logs: Option<Vec<(LogLevel, String)>> = if seq == self.log_seq {
+            None
         } else {
-            Vec::new()
+            self.log_seq = seq;
+            self.shared
+                .logs
+                .lock()
+                .ok()
+                .map(|l| l.iter().map(|line| (map_level(line.level), line.msg.clone())).collect())
         };
 
         if let Ok(mut s) = self.state.lock() {
@@ -248,9 +267,11 @@ impl TunnelApp {
             // Rebuild the console ring from the unified engine log — the engine
             // is the single source of truth, so the view is regenerated rather
             // than appended to.
-            s.logs.clear();
-            for (level, message) in logs {
-                s.logs.push_back(LogEntry { timestamp: String::new(), level, message });
+            if let Some(logs) = logs {
+                s.logs.clear();
+                for (level, message) in logs {
+                    s.logs.push_back(LogEntry { timestamp: String::new(), level, message });
+                }
             }
         }
     }

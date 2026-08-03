@@ -1,15 +1,29 @@
-//! The engine: TUN → smoltcp netstack → ConnManager → Direct outbound.
+//! The engine: bring up the TUN, capture the default route, arm the safety
+//! guards, then run whichever data path the configured exit needs.
 //!
-//! Fully event-driven in BOTH directions: wakes on a TUN packet (upstream), on
-//! the ConnManager's downstream waker (an outbound task delivered server bytes),
-//! on smoltcp's own poll_delay (retransmit / delayed-ACK timers), or shutdown.
-//! Downstream data is serviced the moment it arrives — never parked on a timer.
-//! TUN egress is drained with an awaited send: lossless, backpressured.
+//! Two exits, two mechanisms, chosen once at startup:
+//!
+//!   * **Direct** — transparent proxy. Captured flows terminate in a userspace
+//!     smoltcp stack and are re-originated on pinned OS sockets. Re-originating
+//!     raw IP would be cheaper, but Windows has refused raw TCP sends since XP
+//!     SP2, so OS sockets are the only portable egress. See `conn.rs`.
+//!
+//!   * **WireGuard** — router. We own both ends of the path, so nothing needs
+//!     terminating: packets are NAT'd to the WireGuard client address, encrypted,
+//!     and sent. The app's TCP runs end to end. See `wg.rs`.
+//!
+//! The proxy path is fully event-driven in BOTH directions: it wakes on a TUN
+//! packet (upstream), on the connection manager's readiness queue (a flow's
+//! egress socket delivered bytes, or smoltcp fired a socket waker), on smoltcp's
+//! own poll_delay (retransmit / delayed-ACK timers), on the next flow deadline,
+//! or on shutdown. Downstream data is serviced the moment it arrives — never
+//! parked on a timer. TUN egress is drained with an awaited send: lossless,
+//! backpressured.
 
 use anyhow::{bail, Context, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
@@ -20,16 +34,19 @@ use tracing::{info, warn};
 use crate::conn::{self, ConnManager};
 use crate::device::TunDevice;
 use crate::inspect::{Direction, TrafficMonitor};
-use crate::outbound::{Direct, Outbound};
 use crate::pin::EgressPin;
 use crate::route::{self, FullTunnel};
 use crate::settings::Settings;
-use crate::state::Shared;
+use crate::state::{ExitStats, Shared};
 use crate::tunio::TunIo;
 
 /// Max packets drained from the TUN per wake (keeps one busy flow from starving
 /// the loop; more are picked up next wake).
 const DRAIN_BUDGET: usize = 1024;
+
+/// Ceiling on how long the proxy loop may sleep with nothing else pending. Only
+/// bounds shutdown latency — the data path is woken by events, never by this.
+const MAX_IDLE: Duration = Duration::from_millis(200);
 
 /// Drain everything smoltcp emitted toward the TUN. The awaited send is the
 /// backpressure seam: smoltcp cannot be polled again until the TUN writer has
@@ -38,7 +55,7 @@ const DRAIN_BUDGET: usize = 1024;
 async fn flush_tun(
     device: &mut TunDevice,
     tx: &mpsc::Sender<Vec<u8>>,
-    monitor: &Arc<TrafficMonitor>,
+    monitor: &TrafficMonitor,
 ) -> bool {
     while let Some(pkt) = device.pop_outbound() {
         monitor.record(Direction::Down, &pkt);
@@ -59,46 +76,44 @@ pub async fn run(
     shared: Arc<Shared>,
 ) -> Result<()> {
     let monitor = shared.monitor.clone();
+    let stats = Arc::new(ExitStats::default());
 
     // The uplink was discovered and the egress pin verified in `main` — once,
     // before the route was hijacked — and handed in here, so the engine and the
-    // file channel share one source of truth. `egress` may be unpinned (and
+    // exit share one source of truth. `egress` may be unpinned (and
     // `orig_gateway` empty) if discovery failed; the fallbacks below still hold.
 
-    // Choose the exit: a WireGuard peer (BYO, e.g. Proton) if configured, else
-    // Direct out the host's uplink. Both pin egress to `egress`.
-    let (outbound, exit_label): (Arc<dyn Outbound>, String) = match &settings.wireguard {
-        Some(wg) => {
-            let cfg = crate::wg::WgConfig::from_settings(wg)?;
-            let label = format!("WireGuard → {}", wg.endpoint);
-            info!("Exit: {}", label);
-            (Arc::new(crate::wg::WireGuard::start(cfg, egress.clone())?), label)
-        }
-        None => {
-            info!("Exit: Direct (host uplink)");
-            (Arc::new(Direct::new(egress.clone())), "Direct (uplink)".to_string())
-        }
+    // Resolve the exit before anything is installed, so a malformed WireGuard
+    // config costs one message instead of a half-configured network.
+    let wg_config = match &settings.wireguard {
+        Some(wg) => Some(crate::wg::WgConfig::from_settings(wg)?),
+        None => None,
     };
+    let exit_label = match &settings.wireguard {
+        Some(wg) => format!("WireGuard → {}", wg.endpoint),
+        None => "Direct (uplink)".to_string(),
+    };
+    info!("Exit: {}", exit_label);
 
     // Publish status for the dashboard.
     if let Ok(mut st) = shared.status.lock() {
         st.running = true;
         st.exit = exit_label;
         st.full_tunnel = install_route;
-        st.started_at = Some(std::time::Instant::now());
+        st.started_at = Some(StdInstant::now());
     }
 
     // Bring up the TUN and keep the adapter alive for the session.
     let tun = TunIo::new(settings.tun_ip, settings.tun_prefix, settings.mtu)
         .context("failed to create TUN device")?;
-    let (name, mut rx, tx, mut tun_keepalive) = tun.into_parts();
+    let (name, rx, tx, mut tun_keepalive) = tun.into_parts();
     info!("TUN '{}' up at {}/{}", name, settings.tun_ip, settings.tun_prefix);
 
     // Optionally redirect the default route into the TUN (full capture).
     let _route_guard = if install_route {
         let gateway = FullTunnel::default_gateway_for(settings.tun_ip);
         // Loopback server_ip skips the host-route step: the loop-break here is
-        // egress pinning (Direct), not a host route to a tunnel server.
+        // egress pinning, not a host route to a tunnel server.
         match FullTunnel::install(
             std::net::IpAddr::from([127, 0, 0, 1]),
             &name,
@@ -117,8 +132,10 @@ pub async fn run(
             }
         }
     } else {
-        warn!("Running WITHOUT --route: the default route is untouched, so no host \
-               traffic is captured. Pass --route to tunnel all traffic.");
+        warn!(
+            "Running WITHOUT --route: the default route is untouched, so no host \
+             traffic is captured. Pass --route to tunnel all traffic."
+        );
         None
     };
 
@@ -185,6 +202,94 @@ pub async fn run(
         None
     };
 
+    // Throughput ticker (advances the observability series ~1 Hz), plus
+    // exit-boundary rates. `traffic:` counts at the TUN tap; `exit io:` counts at
+    // the exit socket. Divergence localises loss to a hop.
+    let ticker = {
+        let m = monitor.clone();
+        let s = stats.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(1));
+            let (mut prev_read, mut prev_written) = (0u64, 0u64);
+            loop {
+                iv.tick().await;
+                m.tick();
+                let snap = m.snapshot();
+                if snap.rate_up > 0.0 || snap.rate_down > 0.0 {
+                    info!(
+                        "traffic: up {:.0} B/s, down {:.0} B/s, flows {}",
+                        snap.rate_up, snap.rate_down, snap.active_flows
+                    );
+                }
+                let read = s.read.load(Ordering::Relaxed);
+                let written = s.written.load(Ordering::Relaxed);
+                let dr = read.saturating_sub(prev_read);
+                let dw = written.saturating_sub(prev_written);
+                prev_read = read;
+                prev_written = written;
+                if dr > 0 || dw > 0 {
+                    info!("exit io: read {} B/s, wrote {} B/s", dr, dw);
+                }
+            }
+        })
+    };
+
+    info!("Engine running. Ctrl-C to stop and restore routing.");
+
+    // The data path. Exactly one of these runs for the life of the session.
+    let result = match wg_config {
+        Some(cfg) => {
+            crate::wg::route(cfg, egress, rx, tx, monitor.clone(), stats.clone(), shared.clone())
+                .await
+        }
+        None => proxy(&settings, egress, rx, tx, monitor.clone(), stats.clone(), shared.clone())
+            .await,
+    };
+    ticker.abort();
+
+    // Teardown order: disarm the tripwire and kill switch, restore the resolver,
+    // stop capturing traffic (route guard), THEN remove the TUN. Routes/filters
+    // key on prefix and socket marks, not on the TUN handle, so removing the
+    // interface last avoids a window where the default route points at a dead
+    // interface. Awaiting the TUN shutdown makes interface removal deterministic
+    // (its worker threads release the adapter handle here, not whenever the
+    // runtime happens to reap them), so the next launch always starts clean.
+    drop(_tripwire);
+    drop(_killswitch_guard);
+    drop(_dns_guard);
+    drop(_route_guard);
+    tun_keepalive.shutdown().await;
+
+    // Session flow data → CSV: everything the monitor saw, including flows
+    // evicted from the live table mid-session. Written next to the executable
+    // (the process CWD is unpredictable for a double-clicked GUI app and may not
+    // be writable); timestamped so sessions never clobber each other.
+    let csv_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let csv_path = csv_dir.join(format!(
+        "flows-{}.csv",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    match monitor.write_csv(&csv_path) {
+        Ok(n) => info!("flow table written to {} ({} flows)", csv_path.display(), n),
+        Err(e) => warn!("could not write flow CSV {}: {}", csv_path.display(), e),
+    }
+
+    result
+}
+
+/// Transparent-proxy data path, used when the exit is `Direct`.
+async fn proxy(
+    settings: &Settings,
+    egress: EgressPin,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    monitor: Arc<TrafficMonitor>,
+    stats: Arc<ExitStats>,
+    shared: Arc<Shared>,
+) -> Result<()> {
     // Build the smoltcp interface over the TUN device.
     let mut device = TunDevice::new(settings.mtu as usize);
     let config = Config::new(HardwareAddress::Ip);
@@ -202,63 +307,33 @@ pub async fn run(
         .add_default_ipv4_route(Ipv4Address::new(o[0], o[1], o[2], o[3]));
 
     let mut sockets = SocketSet::new(vec![]);
-    let mut conn = ConnManager::new(outbound, monitor.clone());
-    // Downstream waker: outbound tasks signal this the instant server bytes are
-    // available, so the loop services them immediately instead of on a timer.
-    let wake = conn.waker();
+    let mut conn = ConnManager::new(egress, monitor.clone(), stats);
+    // Readiness queue: smoltcp socket wakers and the egress tasks file flow ids
+    // into it, so a wake carries the identity of what to service.
+    let ready = conn.readiness();
 
-    // Throughput ticker (advances the observability series ~1 Hz), plus
-    // exit-boundary rates. `traffic:` counts at the TUN tap; `exit io:` counts
-    // at the real outbound sockets. Divergence localizes loss to a hop:
-    //   exit read >> traffic down → bytes die inside our stack (smoltcp's log
-    //                               feature now states the drop reason);
-    //   exit read ~ 0 mid-transfer → server paused: our kernel window closed
-    //                               because the app isn't ACKing — the TUN→app
-    //                               delivery hop is the suspect.
-    {
-        let m = monitor.clone();
-        let stats = conn.stats();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(1));
-            let (mut prev_read, mut prev_written) = (0u64, 0u64);
-            loop {
-                iv.tick().await;
-                m.tick();
-                let s = m.snapshot();
-                if s.rate_up > 0.0 || s.rate_down > 0.0 {
-                    info!(
-                        "traffic: up {:.0} B/s, down {:.0} B/s, flows {}",
-                        s.rate_up, s.rate_down, s.active_flows
-                    );
-                }
-                let read = stats.read.load(Ordering::Relaxed);
-                let written = stats.written.load(Ordering::Relaxed);
-                let dr = read.saturating_sub(prev_read);
-                let dw = written.saturating_sub(prev_written);
-                prev_read = read;
-                prev_written = written;
-                if dr > 0 || dw > 0 {
-                    info!("exit io: read {} B/s, wrote {} B/s", dr, dw);
-                }
-            }
-        });
-    }
-
-    info!("Engine running. Ctrl-C to stop and restore routing.");
-
-    // Event-driven poll loop. Wake on: a TUN packet (upstream), the downstream
-    // waker (server bytes arrived), smoltcp's poll_delay (retransmit /
-    // delayed-ACK timers), a periodic shutdown check, or Ctrl-C. The timer arm
-    // is now only smoltcp's protocol timers — never the data path.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut shutdown_check = tokio::time::interval(Duration::from_millis(200));
+
     loop {
-        let delay = iface
+        // Sleep no longer than the soonest of: smoltcp's protocol timers, the
+        // next flow deadline, and the shutdown-latency ceiling. Every one of
+        // those is a timer; data never waits on this arm.
+        let now_std = StdInstant::now();
+        let protocol = iface
             .poll_delay(Instant::now(), &sockets)
-            .map(|d| Duration::from_micros(d.total_micros()))
-            .unwrap_or(Duration::from_millis(200))
-            .min(Duration::from_millis(200));
+            .map(|d| Duration::from_micros(d.total_micros()));
+        let deadline = conn
+            .next_deadline()
+            .map(|at| at.saturating_duration_since(now_std));
+        let delay = match (protocol, deadline) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => MAX_IDLE,
+        }
+        .min(MAX_IDLE);
 
         tokio::select! {
             _ = &mut ctrl_c => {
@@ -273,7 +348,8 @@ pub async fn run(
                             conn.on_packet(&mut sockets, &flow);
                         }
                         device.inject(pkt);
-                        // Opportunistically drain a burst so one wake amortizes many packets.
+                        // Opportunistically drain a burst so one wake amortises
+                        // many packets.
                         let mut drained = 1;
                         while drained < DRAIN_BUDGET {
                             match rx.try_recv() {
@@ -295,9 +371,9 @@ pub async fn run(
                     }
                 }
             }
-            _ = wake.notified() => {}
+            _ = ready.wait() => {}
             _ = shutdown_check.tick() => {
-                if shared.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                if shared.shutdown.load(Ordering::Relaxed) {
                     info!("Dashboard closed — restoring routing");
                     break;
                 }
@@ -305,48 +381,18 @@ pub async fn run(
             _ = tokio::time::sleep(delay) => {}
         }
 
-        let now = Instant::now();
-        iface.poll(now, &mut device, &mut sockets);
-        if !flush_tun(&mut device, &tx, &monitor).await {
-            break;
-        }
-        conn.dispatch(&mut sockets);
-        // Second poll flushes anything dispatch queued into the sockets.
         iface.poll(Instant::now(), &mut device, &mut sockets);
         if !flush_tun(&mut device, &tx, &monitor).await {
             break;
         }
+        // Only the flows smoltcp or an egress task actually woke are touched.
+        // A second poll runs only when dispatch put something in a tx buffer.
+        if conn.dispatch(&mut sockets, StdInstant::now()) {
+            iface.poll(Instant::now(), &mut device, &mut sockets);
+            if !flush_tun(&mut device, &tx, &monitor).await {
+                break;
+            }
+        }
     }
-
-    // Teardown order: disarm the tripwire and kill switch, restore the resolver,
-    // stop capturing traffic (route guard), THEN remove the TUN. Routes/filters key on prefix and
-    // socket marks, not on the TUN handle, so removing the interface last avoids
-    // a window where the default route points at a dead interface. Awaiting the
-    // TUN shutdown makes interface removal deterministic (its worker threads
-    // release the adapter handle here, not whenever the runtime happens to reap
-    // them), so the next launch always starts from a clean adapter.
-    drop(_tripwire);
-    drop(_killswitch_guard);
-    drop(_dns_guard);
-    drop(_route_guard);
-    tun_keepalive.shutdown().await;
-
-    // Session flow data → CSV: everything the monitor saw, including flows
-    // evicted from the live table mid-session. Written next to the executable
-    // (the process CWD is unpredictable for a double-clicked GUI app and may
-    // not be writable); timestamped so sessions never clobber each other.
-    let csv_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let csv_path = csv_dir.join(format!(
-        "flows-{}.csv",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    ));
-    match monitor.write_csv(&csv_path) {
-        Ok(n) => info!("flow table written to {} ({} flows)", csv_path.display(), n),
-        Err(e) => warn!("could not write flow CSV {}: {}", csv_path.display(), e),
-    }
-
     Ok(())
 }

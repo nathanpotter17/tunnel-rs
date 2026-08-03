@@ -18,7 +18,10 @@ pub struct Settings {
     pub tun_ip: Ipv4Addr,
     /// TUN subnet prefix length. /15 spans 198.18.0.0–198.19.255.255.
     pub tun_prefix: u8,
-    /// TUN MTU. Leave headroom under 1500 for whatever the real path needs.
+    /// TUN MTU. This is what the host derives its TCP MSS from, so under a
+    /// WireGuard exit it sets the payload size end to end: leave headroom under
+    /// 1500 for the encapsulation (32 WireGuard + 8 UDP + 20 IP = 60 bytes) and
+    /// for whatever the real path needs beyond that.
     pub mtu: u16,
     /// Resolver forced onto the TUN while full-tunnel is active, so DNS travels
     /// through the tunnel (no leak to a LAN resolver that the exit can't reach).

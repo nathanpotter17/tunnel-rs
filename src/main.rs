@@ -10,7 +10,6 @@ mod device;
 mod engine;
 mod inspect;
 mod killswitch;
-mod outbound;
 mod pin;
 mod preflight;
 mod route;
