@@ -120,23 +120,15 @@ struct FileSink(Arc<Mutex<std::fs::File>>);
 
 impl std::io::Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.0.lock() {
-            Ok(mut f) => f.write(buf),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "log file mutex poisoned",
-            )),
-        }
+        // Poisoning cannot silence the transcript: the lock guards a plain File
+        // handle and nothing under it can panic, so recover the guard and keep
+        // writing — the panic hook itself writes through this sink, on whatever
+        // thread is going down.
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self.0.lock() {
-            Ok(mut f) => f.flush(),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "log file mutex poisoned",
-            )),
-        }
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
     }
 }
 
@@ -180,10 +172,10 @@ async fn main() -> Result<()> {
     for a in &positional {
         match a.as_str() {
             "init" | "gui" => {
-                if command.is_some() {
-                    bail!("multiple commands given: {} and {}", command.unwrap(), a);
+                if let Some(prev) = command {
+                    bail!("multiple commands given: {prev} and {a}");
                 }
-                command = Some(if a == "init" { "init" } else { "gui" });
+                command = Some(a.as_str());
             }
             t if t.ends_with(".toml") => {
                 if settings_path.is_some() {
@@ -232,20 +224,36 @@ async fn main() -> Result<()> {
     // cannot disagree on which uplink is real.
     let (egress, orig_gateway) = pin::discover_egress();
 
+    // One engine future, built once and consumed by whichever tail this build
+    // has. The wrapper is the single place every engine exit passes through, so
+    // it is where the outcome lands in the shared status: `running` goes false
+    // and, on an error, `last_error` carries the reason. The dashboard renders
+    // exactly that — a dead engine can never keep wearing CONNECTED, and the
+    // failure text appears where the user is actually looking.
+    let engine_shared = shared.clone();
+    let engine_fut = async move {
+        let result = engine::run(
+            settings,
+            install_route,
+            egress,
+            orig_gateway,
+            dns_backend,
+            engine_shared.clone(),
+        )
+        .await;
+        if let Ok(mut st) = engine_shared.status.lock() {
+            st.running = false;
+            if let Err(e) = &result {
+                st.last_error = Some(format!("{e:#}"));
+            }
+        }
+        result
+    };
+
     #[cfg(feature = "gui")]
     {
-        let engine_shared = shared.clone();
         let engine = tokio::spawn(async move {
-            if let Err(e) = engine::run(
-                settings,
-                install_route,
-                egress,
-                orig_gateway,
-                dns_backend,
-                engine_shared,
-            )
-            .await
-            {
+            if let Err(e) = engine_fut.await {
                 tracing::error!("engine: {e:#}");
             }
         });
@@ -267,15 +275,7 @@ async fn main() -> Result<()> {
 
     #[cfg(not(feature = "gui"))]
     {
-        let res = engine::run(
-            settings,
-            install_route,
-            egress,
-            orig_gateway,
-            dns_backend,
-            shared.clone(),
-        )
-        .await;
+        let res = engine_fut.await;
         shared.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         res
     }

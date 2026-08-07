@@ -95,14 +95,6 @@ pub async fn run(
     };
     info!("Exit: {}", exit_label);
 
-    // Publish status for the dashboard.
-    if let Ok(mut st) = shared.status.lock() {
-        st.running = true;
-        st.exit = exit_label;
-        st.full_tunnel = install_route;
-        st.started_at = Some(StdInstant::now());
-    }
-
     // Bring up the TUN and keep the adapter alive for the session.
     let tun = TunIo::new(settings.tun_ip, settings.tun_prefix, settings.mtu)
         .context("failed to create TUN device")?;
@@ -133,8 +125,8 @@ pub async fn run(
         }
     } else {
         warn!(
-            "Running WITHOUT --route: the default route is untouched, so no host \
-             traffic is captured. Pass --route to tunnel all traffic."
+            "Running with --no-route: the default route is untouched, so no host \
+             traffic is captured. Run without --no-route to tunnel all traffic."
         );
         None
     };
@@ -234,6 +226,17 @@ pub async fn run(
         })
     };
 
+    // Publish status for the dashboard — only now, with the TUN up and every
+    // guard armed. Publishing before bring-up showed CONNECTED through an
+    // install that could still fail; `main`'s wrapper flips it back off (with
+    // the error) whenever the engine returns.
+    if let Ok(mut st) = shared.status.lock() {
+        st.running = true;
+        st.exit = exit_label;
+        st.full_tunnel = install_route;
+        st.started_at = Some(StdInstant::now());
+    }
+
     info!("Engine running. Ctrl-C to stop and restore routing.");
 
     // The data path. Exactly one of these runs for the life of the session.
@@ -307,7 +310,6 @@ async fn proxy(
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let mut shutdown_check = tokio::time::interval(Duration::from_millis(200));
 
     loop {
         // Sleep no longer than the soonest of: smoltcp's protocol timers, the
@@ -365,13 +367,15 @@ async fn proxy(
                 }
             }
             _ = ready.wait() => {}
-            _ = shutdown_check.tick() => {
-                if shared.shutdown.load(Ordering::Relaxed) {
-                    info!("Dashboard closed — restoring routing");
-                    break;
-                }
-            }
             _ = tokio::time::sleep(delay) => {}
+        }
+
+        // The select's sleep is capped at MAX_IDLE, so a dashboard close is
+        // observed within the same 200 ms the dedicated polling arm used to —
+        // one fewer select arm and no second interval to keep in step with it.
+        if shared.shutdown.load(Ordering::Relaxed) {
+            info!("Dashboard closed — restoring routing");
+            break;
         }
 
         iface.poll(Instant::now(), &mut device, &mut sockets);

@@ -345,7 +345,7 @@ impl TunnelApp {
         };
 
         eframe::run_native(
-            "Quorum IO - VPN v1.0",
+            concat!("Quorum IO — tunnel ", env!("CARGO_PKG_VERSION")),
             options,
             Box::new(move |_cc| Ok(Box::new(TunnelApp::new(shared)))),
         )
@@ -609,8 +609,14 @@ fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, 
 
         ui.add_space(10.0);
 
+        // Three honest states: running, stopped by an error, and not running.
+        // The failure reason is rendered right here — an engine that bailed
+        // (kill switch, resolver, TUN) must never keep wearing CONNECTED.
+        let error_color = Color32::from_rgb(230, 90, 90);
         let (status_text, status_color, connstat) = if status.running {
             ("CONNECTED", theme.text_primary, "[ON]")
+        } else if status.last_error.is_some() {
+            ("ENGINE STOPPED", error_color, "[ERR]")
         } else {
             ("OFFLINE", theme.text_muted, "[OFF]")
         };
@@ -627,6 +633,17 @@ fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, 
                 .size(MONO_PT)
                 .monospace(),
         );
+
+        if let Some(err) = &status.last_error {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(truncate(err, 96))
+                    .color(error_color)
+                    .size(MONO_PT)
+                    .monospace(),
+            )
+            .on_hover_text(err);
+        }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some(started) = status.started_at {

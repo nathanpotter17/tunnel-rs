@@ -157,19 +157,22 @@ mod platform {
             .with_context(|| format!("failed to create Wintun adapter '{}'", ADAPTER_NAME))?;
         let name = adapter.get_name().unwrap_or_else(|_| ADAPTER_NAME.to_string());
 
+        // netsh failures are fatal, not ignored: an adapter without its address
+        // or MTU produces a session that "runs" and moves nothing, and the
+        // failure would otherwise surface much later as unroutable traffic with
+        // no cause in sight. Erroring here drops the adapter Arc, which removes
+        // the half-configured interface before returning.
         let mask = prefix_to_mask(prefix);
-        let _ = std::process::Command::new("netsh")
-            .args([
-                "interface", "ip", "set", "address", &name, "static",
-                &ip.to_string(), &mask,
-            ])
-            .output();
-        let _ = std::process::Command::new("netsh")
-            .args([
-                "interface", "ipv4", "set", "subinterface", &name,
-                &format!("mtu={}", mtu),
-            ])
-            .output();
+        netsh(&[
+            "interface", "ip", "set", "address", &name, "static",
+            &ip.to_string(), &mask,
+        ])
+        .with_context(|| format!("could not assign {ip}/{mask} to adapter '{name}'"))?;
+        netsh(&[
+            "interface", "ipv4", "set", "subinterface", &name,
+            &format!("mtu={}", mtu),
+        ])
+        .with_context(|| format!("could not set MTU {mtu} on adapter '{name}'"))?;
 
         let session = Arc::new(
             adapter.start_session(RING_CAPACITY).context("failed to start Wintun session")?,
@@ -229,6 +232,23 @@ mod platform {
                 name,
             },
         })
+    }
+
+    /// Run netsh, failing with its own output on a non-zero exit.
+    fn netsh(args: &[&str]) -> Result<()> {
+        let out = std::process::Command::new("netsh")
+            .args(args)
+            .output()
+            .context("failed to spawn netsh")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`netsh {}` failed: {}{}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        Ok(())
     }
 
     fn prefix_to_mask(prefix: u8) -> String {

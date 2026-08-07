@@ -332,7 +332,6 @@ fn finish(
 }
 
 /// Classify a packet by application protocol using port + signature heuristics.
-/// Classify a packet by application protocol using port + signature heuristics.
 fn classify(l4: L4, sport: u16, dport: u16, payload: &[u8]) -> AppProto {
     if matches!(l4, L4::Icmp) {
         return AppProto::Icmp;

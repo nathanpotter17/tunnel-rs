@@ -80,6 +80,10 @@ pub struct Status {
     pub exit: String,
     pub full_tunnel: bool,
     pub started_at: Option<Instant>,
+    /// Why the engine stopped, when it stopped on an error. Written by `main`'s
+    /// engine wrapper (the one place every exit passes through) and rendered by
+    /// the dashboard header — a dead engine must never keep wearing CONNECTED.
+    pub last_error: Option<String>,
 }
 
 impl Shared {

@@ -743,7 +743,6 @@ pub async fn route(
     // data flow.
     let mut wg_timer = tokio::time::interval(Duration::from_millis(250));
     let mut housekeeping = tokio::time::interval(Duration::from_secs(10));
-    let mut shutdown_check = tokio::time::interval(Duration::from_millis(200));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
@@ -759,12 +758,6 @@ pub async fn route(
             _ = &mut ctrl_c => {
                 info!("Shutdown signal — restoring routing");
                 break;
-            }
-            _ = shutdown_check.tick() => {
-                if shared.shutdown.load(Ordering::Relaxed) {
-                    info!("Dashboard closed — restoring routing");
-                    break;
-                }
             }
             first = tun_rx.recv() => {
                 let Some(mut pkt) = first else {
@@ -840,6 +833,13 @@ pub async fn route(
                     debug!("nat: expired {} bindings, {} live", dropped, nat.bindings());
                 }
             }
+        }
+
+        // wg_timer fires every 250 ms regardless of traffic, so a dashboard
+        // close is observed within one tick — no dedicated polling arm needed.
+        if shared.shutdown.load(Ordering::Relaxed) {
+            info!("Dashboard closed — restoring routing");
+            break;
         }
     }
     Ok(())
