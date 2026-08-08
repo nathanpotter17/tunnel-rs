@@ -475,20 +475,72 @@ fn fit(cols: &[Col], budget: usize, flex_min: usize, flex_max: usize) -> Vec<Col
 
 /// Pad (or truncate) to exactly `width` characters, always leaving one space of
 /// separation so adjacent columns never run together.
-fn pad(s: &str, width: usize, right: bool) -> String {
-    let t = truncate(s, width.saturating_sub(1).max(1));
+/// Columns of the probe answer table.
+///
+/// NAME is sized for a reverse-DNS name (`38.173.125.74.in-addr.arpa` is 26
+/// characters, and PTR lookups are most of what this widget is pointed at), TYPE
+/// for the longest record label, and TTL for a formatted duration. `DATA` is
+/// capped below the general flexible maximum so that a wide cell spreads its
+/// slack across the other three rather than pouring all of it into the answer.
+///
+/// Module-level so the layout tests measure the real table instead of a copy
+/// that drifts from it — these widths were previously stated twice.
+const PROBE_COLS: [Col; 4] = [
+    Col::new("NAME", 28, false, 2),
+    Col::new("TYPE", 7, false, 1),
+    Col::new("TTL", 8, true, 3),
+    Col::new("DATA", 0, false, 0),
+];
+const PROBE_DATA_MIN: usize = 16;
+const PROBE_DATA_MAX: usize = 45;
+
+/// Lay a value out in exactly `width` characters, one of which is a gutter.
+///
+/// The gutter has to sit on the side facing the NEXT column. A right-aligned
+/// cell padded on the left reserves its blank before the value, leaving the last
+/// character flush against whatever follows — which is how a 1h TTL rendered as
+/// `1hfra24s25-in-f6.1e100.net`. Columns carry their own separation because the
+/// row is drawn with zero item spacing: the characters are the layout.
+fn pad(s: &str, width: usize, right: bool, gutter: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let inner = width.saturating_sub(gutter).max(1);
+    let blanks = width.saturating_sub(inner);
     if right {
-        format!("{:>width$}", t, width = width)
+        format!("{:>inner$}{}", truncate(s, inner), " ".repeat(blanks), inner = inner)
     } else {
-        format!("{:<width$}", t, width = width)
+        format!("{:<width$}", truncate(s, inner), width = width)
+    }
+}
+
+/// How much blank a cell reserves on the side facing the next column.
+///
+/// One character everywhere except a right-aligned column followed by a
+/// left-aligned one, which gets two. At every other boundary the neighbour's own
+/// padding already opens the gap — a right-aligned cell is mostly leading
+/// blanks, a left-aligned one trails off into them. Only at a right→left seam
+/// are both values pushed hard against it, and there a single space reads as a
+/// collision: `1h` beside an answer looked like `1h fra24s25-in-f6.1e100.net`
+/// with no column to speak of.
+///
+/// `TTL`→`DATA` in the probe table is the only such boundary in the window,
+/// which is why this is a rule about neighbours rather than a wider gutter on
+/// every right-aligned column — that would cost `RATE` the width it needs to
+/// print `715.2 KB/s` without an ellipsis.
+fn gutter(col: &Col, next: Option<&Col>) -> usize {
+    match next {
+        Some(n) if col.right && !n.right => 2,
+        _ => 1,
     }
 }
 
 fn table_header(ui: &mut egui::Ui, plan: &[Col], theme: &Theme) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for c in plan {
-            mono_cell(ui, pad(c.title, c.width, c.right), theme.text_muted);
+        for (i, c) in plan.iter().enumerate() {
+            let g = gutter(c, plan.get(i + 1));
+            mono_cell(ui, pad(c.title, c.width, c.right, g), theme.text_muted);
         }
     });
     header_rule(ui, theme);
@@ -499,9 +551,10 @@ fn table_header(ui: &mut egui::Ui, plan: &[Col], theme: &Theme) {
 fn table_row(ui: &mut egui::Ui, plan: &[Col], cell: impl Fn(&str) -> (String, Color32)) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for c in plan {
+        for (i, c) in plan.iter().enumerate() {
             let (text, color) = cell(c.title);
-            mono_cell(ui, pad(&text, c.width, c.right), color);
+            let g = gutter(c, plan.get(i + 1));
+            mono_cell(ui, pad(&text, c.width, c.right, g), color);
         }
     });
 }
@@ -1534,14 +1587,8 @@ fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
 }
 
 fn probe_answers(ui: &mut egui::Ui, wid: u64, outcome: &probe::Outcome, theme: &Theme) {
-    const COLS: [Col; 4] = [
-        Col::new("NAME", 20, false, 2),
-        Col::new("TYPE", 7, false, 1),
-        Col::new("TTL", 8, true, 3),
-        Col::new("DATA", 0, false, 0),
-    ];
     ui.add_space(ROW_GAP);
-    let plan = fit(&COLS, char_budget(ui), 16, 60);
+    let plan = fit(&PROBE_COLS, char_budget(ui), PROBE_DATA_MIN, PROBE_DATA_MAX);
     table_header(ui, &plan, theme);
 
     if outcome.answers.is_empty() {
@@ -1638,8 +1685,8 @@ fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         mono_cell(ui, " ".repeat(SWATCH), theme.text_muted);
-        for c in &plan {
-            mono_cell(ui, pad(c.title, c.width, c.right), theme.text_muted);
+        for (i, c) in plan.iter().enumerate() {
+            mono_cell(ui, pad(c.title, c.width, c.right, gutter(c, plan.get(i + 1))), theme.text_muted);
         }
     });
     header_rule(ui, theme);
@@ -1655,7 +1702,7 @@ fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u
                     ui.painter()
                         .rect_filled(sq, Rounding::ZERO, proto_color(a.name, theme));
                     mono_cell(ui, " ".to_string(), theme.text_muted);
-                    for c in &plan {
+                    for (i, c) in plan.iter().enumerate() {
                         let (text, color) = match c.title {
                             "PROTOCOL" => (a.name.to_string(), theme.text_secondary),
                             "SHARE" => (
@@ -1664,7 +1711,7 @@ fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u
                             ),
                             _ => (format_bytes_short(a.bytes), theme.text_muted),
                         };
-                        mono_cell(ui, pad(&text, c.width, c.right), color);
+                        mono_cell(ui, pad(&text, c.width, c.right, gutter(c, plan.get(i + 1))), color);
                     }
                 });
             }
@@ -1856,7 +1903,7 @@ fn render_composition(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, th
             for a in traffic.apps.iter().filter(|a| a.bytes > 0) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    mono_cell(ui, pad(a.name, name_w, false), theme.text_secondary);
+                    mono_cell(ui, pad(a.name, name_w, false, 1), theme.text_secondary);
                     mono_cell(ui, format!("{:>4}", a.flows), theme.text_muted);
                     mono_cell(ui, format!("{:>8}", format_bytes_short(a.bytes)), theme.text_muted);
                     if show_bar {
@@ -1992,6 +2039,13 @@ fn proto_color(app: &str, theme: &Theme) -> Color32 {
         "DNS" => Color32::from_rgb(230, 200, 100),
         "mDNS" | "LLMNR" => Color32::from_rgb(190, 165, 90),
         "SSDP" | "NetBIOS" => Color32::from_rgb(140, 130, 170),
+        // One family, one hue: uTP carries the bytes and the other three are
+        // slivers beside it, so they read as parts of a whole rather than as
+        // four unrelated protocols that happen to appear together.
+        "uTP" => Color32::from_rgb(90, 200, 190),
+        "BitTorrent" => Color32::from_rgb(60, 160, 155),
+        "DHT" => Color32::from_rgb(130, 220, 210),
+        "BT Tracker" => Color32::from_rgb(45, 125, 120),
         "HTTP" => Color32::from_rgb(150, 190, 220),
         "SSH" => Color32::from_rgb(200, 120, 200),
         "NTP" | "DHCP" | "DHCPv6" => Color32::from_rgb(120, 160, 160),
@@ -2133,13 +2187,6 @@ mod tests {
         Col::new("RATE", 11, true, 0),
     ];
 
-    const PROBE_COLS: [Col; 4] = [
-        Col::new("NAME", 20, false, 2),
-        Col::new("TYPE", 7, false, 1),
-        Col::new("TTL", 8, true, 3),
-        Col::new("DATA", 0, false, 0),
-    ];
-
     fn at(budget: usize) -> Vec<&'static str> {
         fit(&FLOW_COLS, budget, 14, 30)
             .iter()
@@ -2254,20 +2301,101 @@ mod tests {
     #[test]
     fn the_probe_table_keeps_the_answer_when_the_cell_is_narrow() {
         // DATA is the answer; NAME echoes the question that is already on the
-        // status line above. In a narrow widget the answer is what survives.
-        let narrow: Vec<&str> = fit(&PROBE_COLS, 26, 16, 60).iter().map(|c| c.title).collect();
+        // status line above. In a very narrow widget the answer is what survives.
+        let narrow: Vec<&str> = fit(&PROBE_COLS, 26, PROBE_DATA_MIN, PROBE_DATA_MAX)
+            .iter()
+            .map(|c| c.title)
+            .collect();
         assert!(narrow.contains(&"DATA"));
         assert!(!narrow.contains(&"TTL"));
     }
 
     #[test]
-    fn pad_produces_exactly_the_requested_character_count() {
-        assert_eq!(pad("abc", 6, false).chars().count(), 6);
-        assert_eq!(pad("abc", 6, true).chars().count(), 6);
-        assert_eq!(pad("abcdefghij", 5, false).chars().count(), 5);
-        // Always at least one space of separation after truncation.
-        assert!(pad("abcdefghij", 5, false).ends_with(' '));
-        assert!(pad("abcdefghij", 5, true).starts_with(' '));
+    fn the_probe_table_fits_a_reverse_dns_name() {
+        // A PTR name is the long field and the whole point of the lookup, so it
+        // has to fit at the width the widget actually gets (~78 characters in
+        // the default five-widget layout) rather than be shortened to an ellipsis.
+        let sample = "38.173.125.74.in-addr.arpa";
+        let plan = fit(&PROBE_COLS, 78, PROBE_DATA_MIN, PROBE_DATA_MAX);
+        let name = plan.iter().find(|c| c.title == "NAME").expect("NAME dropped at 78");
+        assert_eq!(
+            pad(sample, name.width, false, 1).trim_end(),
+            sample,
+            "NAME is {} wide, too narrow for a reverse-DNS name",
+            name.width
+        );
+
+        // At the narrowest a widget can be, the name still survives: the TTL is
+        // what goes, because it is the field you can most afford to lose.
+        let narrow: Vec<&str> = fit(&PROBE_COLS, 54, PROBE_DATA_MIN, PROBE_DATA_MAX)
+            .iter()
+            .map(|c| c.title)
+            .collect();
+        assert_eq!(narrow, ["NAME", "TYPE", "DATA"]);
+    }
+
+    #[test]
+    fn every_cell_ends_in_a_gutter_so_columns_cannot_touch() {
+        // The bug this pins: a right-aligned cell reserved its blank on the LEFT,
+        // so its last character sat flush against the next column. A 1h TTL
+        // beside an answer rendered as `1hfra24s25-in-f6.1e100.net`.
+        //
+        // Rows are drawn with zero item spacing — the characters ARE the layout —
+        // so this is the only thing keeping two columns apart.
+        for right in [false, true] {
+            for g in [1, 2] {
+                for width in 2..14usize {
+                    for value in ["", "x", "1h", "abcdefghijklmnopqrst", "24h"] {
+                        let cell = pad(value, width, right, g);
+                        assert_eq!(
+                            cell.chars().count(),
+                            width,
+                            "{value:?} at width {width} (right={right}, gutter={g})"
+                        );
+                        assert!(
+                            cell.ends_with(' '),
+                            "{cell:?} would touch the next column (right={right})"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(pad("1h", 8, true, 2), "    1h  ");
+        assert_eq!(pad("abc", 6, false, 1), "abc   ");
+
+        // The wider gutter is spent only where it is needed.
+        let right_then_left = (Col::new("TTL", 8, true, 0), Col::new("DATA", 8, false, 0));
+        assert_eq!(gutter(&right_then_left.0, Some(&right_then_left.1)), 2);
+        assert_eq!(gutter(&right_then_left.1, Some(&right_then_left.0)), 1);
+        assert_eq!(gutter(&right_then_left.0, None), 1, "the last column has no neighbour");
+    }
+
+    #[test]
+    fn a_probe_row_reads_as_four_separated_columns() {
+        // The rendered result, not just the invariants behind it: this table is
+        // a character grid, so the only honest check is what the grid says.
+        let plan = fit(&PROBE_COLS, 78, PROBE_DATA_MIN, PROBE_DATA_MAX);
+        let render = |v: &dyn Fn(&str) -> &str| -> String {
+            plan.iter()
+                .enumerate()
+                .map(|(i, c)| pad(v(c.title), c.width, c.right, gutter(c, plan.get(i + 1))))
+                .collect()
+        };
+        let row = render(&|title| match title {
+            "NAME" => "38.173.125.74.in-addr.arpa",
+            "TYPE" => "PTR",
+            "TTL" => "1h",
+            _ => "fra24s25-in-f6.1e100.net",
+        });
+        let head = render(&|title| title);
+
+        assert_eq!(row.chars().count(), 78);
+        assert_eq!(head.chars().count(), 78);
+        assert_eq!(
+            row.trim_end(),
+            "38.173.125.74.in-addr.arpa  PTR        1h  fra24s25-in-f6.1e100.net"
+        );
+        assert_eq!(head.trim_end(), "NAME                        TYPE      TTL  DATA");
     }
 
     #[test]
@@ -2478,6 +2606,9 @@ mod tests {
         for s in [
             "QUORUM IO", "[ON]", "[OFF]", "[ERR]", "CONNECTED", "ENGINE STOPPED", "OFFLINE",
             "FWD IDLE ERR",
+            // Protocol labels reach the screen from inspect.rs, so they belong
+            // in this registry too — `uTP` is one keystroke from `µTP`.
+            "BitTorrent uTP DHT BT Tracker Obfuscated WireGuard OpenVPN Shadowsocks",
             "LOOKUP", "ACTIVE", "filter", "live only", "resolver", "host or address",
             "no active hosts", "no traffic yet", "no flows match the filter", "no widgets",
             "no remote hosts yet", "no services yet", "no classified traffic yet",

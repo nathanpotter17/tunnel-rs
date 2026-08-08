@@ -93,6 +93,21 @@ pub enum AppProto {
     OpenVpn,
     Shadowsocks,
     Obfuscated,
+    /// Peer wire protocol over TCP (BEP 3).
+    BitTorrent,
+    /// Micro Transport Protocol (BEP 29) — BitTorrent's UDP transport, and the
+    /// bulk of a swarm's bytes. Carries piece data, so it dominates a torrent
+    /// session by volume while every other BitTorrent label stays tiny.
+    ///
+    /// Labelled `uTP`, not `µTP`. The bundled fonts do carry U+00B5, but this
+    /// label is also written to the flow CSV, and ASCII there is worth more than
+    /// the correct spelling here.
+    Utp,
+    /// Mainline DHT (BEP 5): bencoded KRPC over UDP. Many small exchanges with
+    /// many peers, so it dominates by FLOW COUNT rather than by bytes.
+    Dht,
+    /// UDP tracker protocol (BEP 15).
+    BtTracker,
     Ssh,
     Ntp,
     Dhcp,
@@ -117,6 +132,10 @@ impl AppProto {
             AppProto::OpenVpn => "OpenVPN",
             AppProto::Shadowsocks => "Shadowsocks",
             AppProto::Obfuscated => "Obfuscated",
+            AppProto::BitTorrent => "BitTorrent",
+            AppProto::Utp => "uTP",
+            AppProto::Dht => "DHT",
+            AppProto::BtTracker => "BT Tracker",
             AppProto::Ssh => "SSH",
             AppProto::Ntp => "NTP",
             AppProto::Dhcp => "DHCP",
@@ -150,8 +169,19 @@ impl AppProto {
             | AppProto::Shadowsocks
             | AppProto::Igmp
             | AppProto::Icmp => 2,
-            // Payload-signature protocols.
-            AppProto::Tls | AppProto::Quic | AppProto::WireGuard => 3,
+            // Payload-signature protocols. The BitTorrent family sits here
+            // because none of it is recognised by port — it is signature or
+            // nothing. Ranking equal to the rest also means first-match wins
+            // within a flow, which is what protects a tracker exchange whose
+            // opening magic is unmistakable from being relabelled by a later
+            // announce that carries no signature at all.
+            AppProto::Tls
+            | AppProto::Quic
+            | AppProto::WireGuard
+            | AppProto::BitTorrent
+            | AppProto::Utp
+            | AppProto::Dht
+            | AppProto::BtTracker => 3,
         }
     }
 }
@@ -349,9 +379,28 @@ fn classify(l4: L4, sport: u16, dport: u16, payload: &[u8]) -> AppProto {
         if is_quic(payload) {
             return AppProto::Quic;
         }
+        // BitTorrent negotiates its ports, so there is nothing to look them up
+        // by — every one of these is decided on payload shape alone. Ordered
+        // most specific first, though the three cannot collide: a tracker
+        // request opens with two zero bytes, DHT with 'd' (0x64), and uTP
+        // requires a version nibble of 1, which neither satisfies.
+        if is_bt_tracker(payload) {
+            return AppProto::BtTracker;
+        }
+        if is_dht(payload) {
+            return AppProto::Dht;
+        }
+        if is_utp(payload) {
+            return AppProto::Utp;
+        }
     }
-    if matches!(l4, L4::Tcp) && is_tls(payload) {
-        return AppProto::Tls;
+    if matches!(l4, L4::Tcp) {
+        if is_tls(payload) {
+            return AppProto::Tls;
+        }
+        if is_bittorrent(payload) {
+            return AppProto::BitTorrent;
+        }
     }
 
     // Well-known ports. 53 before 5353 so unicast DNS keeps its label.
@@ -437,6 +486,66 @@ fn is_quic(p: &[u8]) -> bool {
 /// TLS record: handshake(0x16) with a plausible ProtocolVersion (0x03 0x0x).
 fn is_tls(p: &[u8]) -> bool {
     p.len() >= 3 && p[0] == 0x16 && p[1] == 0x03 && p[2] <= 0x04
+}
+
+/// BitTorrent peer handshake (BEP 3): a length byte of 19 followed by exactly
+/// that many characters of the protocol name. Nothing to tune and no false
+/// positive to weigh — but it only catches UNENCRYPTED peer connections. A
+/// client with Message Stream Encryption on opens with a Diffie-Hellman key,
+/// which is random by construction and lands in `Obfuscated`, as it should.
+fn is_bittorrent(p: &[u8]) -> bool {
+    p.len() >= 20 && p[0] == 19 && &p[1..20] == b"BitTorrent protocol"
+}
+
+/// uTP (BEP 29): 20-byte header, low nibble of byte 0 the version (always 1),
+/// high nibble the packet type (0..=4).
+///
+/// Those nibbles alone match one byte in 51, which across a saturated swarm is a
+/// steady trickle of mislabelled flows. Two structural checks close it: the
+/// extension field is a short chain (0, 1 or 2 in every implementation in the
+/// wild), and the advertised window is a real receive buffer rather than a
+/// random word. Together they leave roughly one random payload in a million.
+fn is_utp(p: &[u8]) -> bool {
+    if p.len() < 20 {
+        return false;
+    }
+    let (kind, version) = (p[0] >> 4, p[0] & 0x0f);
+    if version != 1 || kind > 4 || p[1] > 2 {
+        return false;
+    }
+    let window = u32::from_be_bytes([p[12], p[13], p[14], p[15]]);
+    window <= 16 * 1024 * 1024
+}
+
+/// Mainline DHT (BEP 5): bencoded KRPC over UDP.
+///
+/// Matched on the first key only. Bencode sorts a dict's keys, so the opener is
+/// fixed: `a` for a query's arguments, `r` for a response, `e` for an error, or
+/// `ip` where a client prepends the caller's address (BEP 42) — which sorts
+/// ahead of all three. The message-type key `y` would be a stronger signature
+/// but sorts LAST, and finding it means walking the whole payload on the packet
+/// path to reject most of them at the final byte.
+fn is_dht(p: &[u8]) -> bool {
+    if p.len() < 12 || p[0] != b'd' {
+        return false;
+    }
+    let rest = &p[1..];
+    rest.starts_with(b"1:ad")
+        || rest.starts_with(b"1:rd")
+        || rest.starts_with(b"1:el")
+        || rest.starts_with(b"2:ip")
+}
+
+/// UDP tracker protocol (BEP 15) connect request: the protocol's magic
+/// connection id followed by action 0.
+///
+/// Only the connect handshake is detectable — announce and scrape quote the id
+/// the tracker just issued, which is indistinguishable from any other eight
+/// bytes. That is enough, because connect is the FIRST packet of a tracker
+/// exchange and a flow is labelled from its first packet.
+fn is_bt_tracker(p: &[u8]) -> bool {
+    const MAGIC: [u8; 8] = [0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80];
+    p.len() >= 16 && p[..8] == MAGIC && p[8..12] == [0, 0, 0, 0]
 }
 
 /// Shannon entropy in bits/byte over the first 256 bytes.
@@ -1178,6 +1287,89 @@ mod tests {
         let parsed = parse(&p).unwrap();
         assert_eq!(parsed.l4.label(), "ICMP");
         assert_eq!(parsed.app.label(), "ICMP");
+    }
+
+    /// A uTP header (BEP 29) with the given packet type.
+    fn utp(kind: u8) -> Vec<u8> {
+        let mut h = vec![0u8; 20];
+        h[0] = (kind << 4) | 1; // type + version 1
+        h[1] = 0; // no extensions
+        h[12..16].copy_from_slice(&65_536u32.to_be_bytes()); // wnd_size
+        h
+    }
+
+    #[test]
+    fn classifies_every_part_of_a_bittorrent_session() {
+        // BitTorrent negotiates its ports, so none of these can be recognised by
+        // port — a swarm is the traffic most likely to arrive unlabelled, and it
+        // is the traffic a torrenting session is almost entirely made of.
+        let app = |payload: &[u8]| {
+            parse(&v4_udp([10, 0, 0, 2], [1, 2, 3, 4], 51413, 6881, payload))
+                .unwrap()
+                .app
+                .label()
+        };
+
+        // uTP carries the piece data, so it is the bulk of the bytes.
+        for kind in 0..=4u8 {
+            assert_eq!(app(&utp(kind)), "uTP", "uTP packet type {kind}");
+        }
+
+        // DHT: bencoded KRPC, matched on the first key. All four openers.
+        assert_eq!(app(b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:y1:qe"), "DHT");
+        assert_eq!(app(b"d1:rd2:id20:aaaaaaaaaaaaaaaaaaaae1:y1:re"), "DHT");
+        assert_eq!(app(b"d1:eli201e23:A Generic Errore1:y1:ee"), "DHT");
+        // Some clients prepend the caller's address, which sorts first (BEP 42).
+        assert_eq!(app(b"d2:ip6:abcdef1:rd2:id20:aaaaaaaaaaaaaaaaaaaae1:y1:re"), "DHT");
+
+        // BEP 15 tracker connect: the protocol's magic id, then action 0.
+        let mut connect = vec![0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80];
+        connect.extend_from_slice(&0u32.to_be_bytes()); // action: connect
+        connect.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // transaction
+        assert_eq!(app(&connect), "BT Tracker");
+
+        // The unencrypted peer handshake, over TCP.
+        let mut hs = vec![19u8];
+        hs.extend_from_slice(b"BitTorrent protocol");
+        hs.extend_from_slice(&[0u8; 8]);
+        assert_eq!(classify(L4::Tcp, 51413, 6881, &hs).label(), "BitTorrent");
+    }
+
+    #[test]
+    fn the_utp_signature_does_not_swallow_neighbouring_traffic() {
+        let app = |payload: &[u8]| classify(L4::Udp, 51413, 6881, payload).label();
+
+        // Version nibble must be 1: this is the check doing most of the work.
+        let mut wrong_version = utp(0);
+        wrong_version[0] = 0x02;
+        assert_ne!(app(&wrong_version), "uTP");
+
+        // Type nibble tops out at ST_SYN (4).
+        let mut wrong_kind = utp(0);
+        wrong_kind[0] = (5 << 4) | 1;
+        assert_ne!(app(&wrong_kind), "uTP");
+
+        // The extension field is a short chain, never an arbitrary byte.
+        let mut wrong_ext = utp(0);
+        wrong_ext[1] = 0x9f;
+        assert_ne!(app(&wrong_ext), "uTP");
+
+        // An implausible receive window is what rejects random payloads that
+        // happen to open with a valid-looking first byte.
+        let mut huge_window = utp(0);
+        huge_window[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_ne!(app(&huge_window), "uTP");
+
+        // Too short to be a header at all.
+        assert_ne!(app(&utp(0)[..19]), "uTP");
+
+        // And the protocols that share the wire with it keep their own labels:
+        // a swarm runs alongside QUIC and DNS, and those are matched first.
+        let mut quic = vec![0xc0];
+        quic.extend_from_slice(&1u32.to_be_bytes());
+        quic.extend_from_slice(&[0u8; 20]);
+        assert_eq!(app(&quic), "QUIC");
+        assert_eq!(classify(L4::Udp, 53, 40000, &utp(0)).label(), "uTP");
     }
 
     #[test]
