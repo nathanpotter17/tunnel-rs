@@ -79,7 +79,25 @@ pub struct Status {
     /// e.g. "WireGuard → 1.2.3.4:51820" or "Direct (uplink)".
     pub exit: String,
     pub full_tunnel: bool,
+    /// The resolver the engine pinned onto the TUN, once it has. Published so
+    /// an active probe (`probe.rs`) asks the same nameserver the rest of the
+    /// host is using — a lookup aimed somewhere else would answer a question
+    /// nobody asked.
+    pub dns: Option<std::net::Ipv4Addr>,
     pub started_at: Option<Instant>,
+    /// The forwarded inbound port currently open, if any. Under a lease this is
+    /// written by the exit driver as the gateway grants and regrants it, so it
+    /// is what is actually open rather than what was configured.
+    pub forward_port: Option<u16>,
+    /// Why there is no forwarded port, when one was asked for. Distinguishes
+    /// "not configured" from "configured and failing", which `forward_port`
+    /// being `None` cannot.
+    pub forward_error: Option<String>,
+    /// Packets accepted through that port. Shown beside it because the port is
+    /// assigned out of band and goes stale silently: on a working tunnel a count
+    /// stuck at zero means the forward is not live, and nothing else tells the
+    /// difference between that and a swarm nobody happens to be dialling.
+    pub forwarded_in: u64,
     /// Why the engine stopped, when it stopped on an error. Written by `main`'s
     /// engine wrapper (the one place every exit passes through) and rendered by
     /// the dashboard header — a dead engine must never keep wearing CONNECTED.

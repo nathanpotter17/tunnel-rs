@@ -34,7 +34,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::inspect::{Direction, TrafficMonitor};
 use crate::pin::{self, EgressPin};
-use crate::settings::WgSettings;
+use crate::settings::{Method, PortForward, WgSettings};
 use crate::state::{ExitStats, Shared};
 
 /// Scratch for one encapsulated/decapsulated datagram. A WireGuard datagram
@@ -96,10 +96,56 @@ pub struct WgConfig {
     endpoint: SocketAddr,
     address: Ipv4Addr,
     keepalive: Option<u16>,
+    /// How the inbound forwarded port is obtained, if at all.
+    forward: Option<ForwardPlan>,
+}
+
+/// Where the forwarded port comes from, resolved to addresses.
+#[derive(Clone, Copy)]
+pub enum ForwardPlan {
+    /// Known up front; installed before the first packet moves.
+    Fixed { host: Ipv4Addr, port: u16 },
+    /// Leased from the gateway at runtime and renewed for the session, so the
+    /// port is not known until [`crate::portmap`] reports one — and can change
+    /// under us if the gateway restarts.
+    Leased { host: Ipv4Addr, gateway: Ipv4Addr },
+}
+
+/// The gateway's address on the tunnel: our address with the host part set to 1.
+///
+/// This is the convention every WireGuard VPN provider follows (Proton hands out
+/// 10.2.0.2 and answers on 10.2.0.1), and NAT-PMP has no discovery mechanism —
+/// RFC 6886 assumes the client already knows its default gateway, which is not
+/// a question the host's routing table can answer here, since the engine has
+/// pointed the default route at its own TUN.
+fn tunnel_gateway(address: Ipv4Addr) -> Ipv4Addr {
+    let [a, b, c, _] = address.octets();
+    Ipv4Addr::new(a, b, c, 1)
+}
+
+/// Stops a background thread when the owner is dropped, whatever the exit path.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl StopOnDrop {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl WgConfig {
-    pub fn from_settings(s: &WgSettings) -> Result<Self> {
+    /// `tun_ip` is where inbound packets on a forwarded port are delivered — the
+    /// host's own address on the TUN, which `WgSettings` does not know about.
+    pub fn from_settings(s: &WgSettings, tun_ip: Ipv4Addr) -> Result<Self> {
         let private_key = decode_key(&s.private_key).context("invalid wireguard private_key")?;
         let peer_public = decode_key(&s.public_key).context("invalid wireguard public_key")?;
         let preshared = match &s.preshared_key {
@@ -118,7 +164,20 @@ impl WgConfig {
         } else {
             None
         };
-        Ok(Self { private_key, peer_public, preshared, endpoint, address, keepalive })
+        // Port 0 is not a port. Rejected here rather than silently ignored: a
+        // typo that disables the feature quietly is worse than one that fails.
+        let forward = match s.port_forward {
+            Some(PortForward::Fixed(0)) => {
+                anyhow::bail!("wireguard.port_forward must be 1-65535 or \"nat-pmp\", not 0")
+            }
+            Some(PortForward::Fixed(port)) => Some(ForwardPlan::Fixed { host: tun_ip, port }),
+            Some(PortForward::Leased(Method::NatPmp)) => Some(ForwardPlan::Leased {
+                host: tun_ip,
+                gateway: tunnel_gateway(address),
+            }),
+            None => None,
+        };
+        Ok(Self { private_key, peer_public, preshared, endpoint, address, keepalive, forward })
     }
 }
 
@@ -172,6 +231,27 @@ struct Binding {
     last: Instant,
 }
 
+/// A statically forwarded port: the one mapping this NAT holds without having
+/// watched the conversation start.
+///
+/// Everything else here is outbound-initiated — inbound is matched against state
+/// an outbound packet created, and unmatched inbound is dropped. A provider that
+/// forwards `exit_ip:port` to us breaks that assumption on purpose, so the port
+/// needs state that exists before the first packet does.
+///
+/// It differs from a `Binding` in two ways that matter. It never expires, since
+/// no conversation refreshes it. And it is ENDPOINT-INDEPENDENT — a cone mapping
+/// — where every other mapping here is keyed on the peer as well as the port.
+#[derive(Clone, Copy)]
+struct Forward {
+    /// Host address inbound packets are delivered to.
+    host: Ipv4Addr,
+    /// External and internal port at once: the provider maps the number to
+    /// itself and the host application listens on it, so nothing is translated
+    /// but the address.
+    port: u16,
+}
+
 /// Why a packet was or was not translated. Distinguishes "not ours / not
 /// routable" (silent, expected) from "no capacity" (reported, an admission
 /// action) so the two never read the same in the log.
@@ -196,6 +276,13 @@ pub struct Nat {
     /// just-released port out of reuse for a full cycle, so a late duplicate from
     /// a dead conversation cannot land on a new one.
     next_port: u16,
+    /// The provider-forwarded port, if one is configured. See [`Forward`].
+    forward: Option<Forward>,
+    /// Inbound packets accepted through the forward. The only direct evidence
+    /// that the provider is actually forwarding the configured port — the number
+    /// is assigned out of band and can go stale silently, and a stale one is
+    /// indistinguishable from a quiet swarm without this.
+    forwarded_in: u64,
 }
 
 impl Nat {
@@ -206,11 +293,35 @@ impl Nat {
             rev: HashMap::new(),
             frag: HashMap::new(),
             next_port: PORT_LO,
+            forward: None,
+            forwarded_in: 0,
         }
+    }
+
+    /// Open the provider-forwarded port. Inbound packets for it are delivered to
+    /// `host` on the same port, and the host's replies from it keep it as their
+    /// source. See [`Forward`].
+    pub fn set_forward(&mut self, host: Ipv4Addr, port: u16) {
+        self.forward = Some(Forward { host, port });
+    }
+
+    /// Shut the forwarded port. Called when a lease is lost: continuing to
+    /// accept unsolicited inbound on a port nothing forwards any more would be
+    /// a hole held open for no reason.
+    pub fn clear_forward(&mut self) {
+        self.forward = None;
     }
 
     pub fn bindings(&self) -> usize {
         self.rev.len()
+    }
+
+    pub fn forwarded_in(&self) -> u64 {
+        self.forwarded_in
+    }
+
+    pub fn forward_port(&self) -> Option<u16> {
+        self.forward.map(|f| f.port)
     }
 
     /// Allocate an unused port for `proto`. `None` at the ceiling, which the
@@ -223,7 +334,13 @@ impl Nat {
         for _ in 0..span {
             let port = self.next_port;
             self.next_port = if port >= PORT_HI { PORT_LO } else { port + 1 };
-            if !self.rev.contains_key(&RevKey { proto, port }) {
+            // The forwarded port is reserved. Inbound demultiplexing for it keys
+            // on the number alone, so an outbound flow handed the same number
+            // would be indistinguishable from a peer dialling the forward.
+            // (ICMP identifiers are a separate space and cannot collide.)
+            let reserved = matches!(proto, PROTO_TCP | PROTO_UDP)
+                && self.forward.is_some_and(|f| f.port == port);
+            if !reserved && !self.rev.contains_key(&RevKey { proto, port }) {
                 return Some(port);
             }
         }
@@ -287,6 +404,23 @@ impl Nat {
                 return Verdict::Translate;
             }
         };
+
+        // The forwarded port is a CONE mapping: one external port for this local
+        // port whatever the peer. The allocator below is endpoint-dependent by
+        // design (see `FwdKey`), so it would hand each new peer a different
+        // source port — and a peer that dialled the forward would be answered
+        // from an address it never contacted. TCP resets it; uTP ignores it. The
+        // symptom is inbound that appears to arrive and never connects.
+        //
+        // Only the address is rewritten. The provider maps the number to itself,
+        // so the source port is already correct, and no binding is created: the
+        // mapping is static and nothing here can expire it.
+        if let Some(f) = self.forward {
+            if matches!(h.proto, PROTO_TCP | PROTO_UDP) && src == f.host && sport == f.port {
+                rewrite_src_addr(pkt, h.ihl, src, new_src, Some(h.proto));
+                return Verdict::Translate;
+            }
+        }
 
         let key = FwdKey { proto: h.proto, src, sport, dst, dport };
         let port = match self.fwd.get(&key) {
@@ -366,6 +500,26 @@ impl Nat {
             _ => return Verdict::Drop,
         };
 
+        // The forwarded port: inbound with no outbound packet behind it, which is
+        // precisely what the drop below exists to stop. This is the one sanctioned
+        // exception, and the allocator reserving the number is what keeps it from
+        // shadowing a real binding. Checked against the port alone — a cone
+        // mapping accepts every peer, which is the point of a forwarded port.
+        if let Some(f) = self.forward {
+            if matches!(h.proto, PROTO_TCP | PROTO_UDP) && port == f.port {
+                if h.more_fragments {
+                    self.frag.insert(
+                        FragKey { src: h.src, ip_id: h.ip_id, proto: h.proto },
+                        (f.host, now),
+                    );
+                }
+                // Address only: the port is the same number on both sides.
+                rewrite_dst_addr(pkt, h.ihl, self.wg_addr, f.host, Some(h.proto));
+                self.forwarded_in = self.forwarded_in.saturating_add(1);
+                return Verdict::Translate;
+            }
+        }
+
         let Some(b) = self.rev.get_mut(&RevKey { proto: h.proto, port }).map(|b| {
             b.last = now;
             *b
@@ -416,11 +570,23 @@ impl Nat {
             },
             _ => return Verdict::Drop,
         };
-        let Some(b) = self.rev.get_mut(&RevKey { proto: inner.proto, port }).map(|b| {
-            b.last = now;
-            *b
-        }) else {
-            return Verdict::Drop;
+        // Resolve the quote to a host endpoint: normally the binding that emitted
+        // it, or the forward when the forwarded port did. Without the second case
+        // path MTU discovery breaks for exactly the flows carrying bulk data, and
+        // it breaks as a stall rather than an error.
+        let (host, hport) = if let Some(f) = self
+            .forward
+            .filter(|f| matches!(inner.proto, PROTO_TCP | PROTO_UDP) && port == f.port)
+        {
+            (f.host, f.port)
+        } else {
+            let Some(b) = self.rev.get_mut(&RevKey { proto: inner.proto, port }).map(|b| {
+                b.last = now;
+                *b
+            }) else {
+                return Verdict::Drop;
+            };
+            (b.src, b.sport)
         };
 
         // Restore the quote in place, patching its own checksums so a strict host
@@ -429,10 +595,10 @@ impl Nat {
         // errors are rare and small, so an O(n) recompute here is not a hot path.
         {
             let quote = &mut pkt[q..];
-            rewrite_src_addr(quote, inner.ihl, self.wg_addr, b.src, Some(inner.proto));
-            rewrite_src_port(quote, inner.ihl, inner.proto, port, b.sport);
+            rewrite_src_addr(quote, inner.ihl, self.wg_addr, host, Some(inner.proto));
+            rewrite_src_port(quote, inner.ihl, inner.proto, port, hport);
         }
-        rewrite_dst_addr(pkt, ihl, self.wg_addr, b.src, None);
+        rewrite_dst_addr(pkt, ihl, self.wg_addr, host, None);
         let icmp = &mut pkt[ihl..];
         icmp[2] = 0;
         icmp[3] = 0;
@@ -736,6 +902,32 @@ pub async fn route(
     );
 
     let mut nat = Nat::new(config.address);
+
+    // A leased port is not known yet and will arrive on this channel, possibly
+    // more than once: a gateway restart renegotiates and can come back with a
+    // different number. The NAT is owned by this task, so the lease thread can
+    // only ask, never write.
+    let (fwd_tx, mut fwd_rx) = mpsc::channel::<crate::portmap::Event>(8);
+    // However this task leaves — break, early return, unwind — the lease thread
+    // stops with it. Dropping the receiver alone would also stop it, but only
+    // after its next renewal wakes up, leaving a thread and a socket behind for
+    // up to half a lease.
+    let stop_portmap = StopOnDrop::new();
+    let forward_host = match config.forward {
+        Some(ForwardPlan::Fixed { host, port }) => {
+            nat.set_forward(host, port);
+            if let Ok(mut st) = shared.status.lock() {
+                st.forward_port = Some(port);
+            }
+            info!("inbound port forwarding: :{} open to {} (fixed)", port, host);
+            Some(host)
+        }
+        Some(ForwardPlan::Leased { host, gateway }) => {
+            crate::portmap::spawn(gateway, fwd_tx, stop_portmap.flag());
+            Some(host)
+        }
+        None => None,
+    };
     let mut scratch = vec![0u8; SCRATCH];
     let mut recv_buf = vec![0u8; SCRATCH];
 
@@ -827,10 +1019,47 @@ pub async fn route(
                     let _ = udp.send(out).await;
                 }
             }
+            Some(ev) = fwd_rx.recv(), if forward_host.is_some() => {
+                let host = forward_host.expect("guarded by the arm's condition");
+                match ev {
+                    crate::portmap::Event::Mapped { port } => {
+                        // Sent on every renewal, so most of these are no-ops.
+                        // Acting on the change only is what matters: a gateway
+                        // restart renegotiates and can hand back a different
+                        // number, and the NAT must follow it or forward a port
+                        // the exit no longer maps.
+                        let changed = nat.forward_port() != Some(port);
+                        nat.set_forward(host, port);
+                        if changed {
+                            info!("inbound port forwarding: :{} open to {} (leased)", port, host);
+                        }
+                        if let Ok(mut st) = shared.status.lock() {
+                            st.forward_port = Some(port);
+                            st.forward_error = None;
+                        }
+                    }
+                    crate::portmap::Event::Lost { reason } => {
+                        nat.clear_forward();
+                        if let Ok(mut st) = shared.status.lock() {
+                            st.forward_port = None;
+                            st.forward_error = Some(reason);
+                        }
+                    }
+                }
+            }
             _ = housekeeping.tick() => {
                 let dropped = nat.expire(Instant::now());
                 if dropped > 0 {
                     debug!("nat: expired {} bindings, {} live", dropped, nat.bindings());
+                }
+                // The NAT owns the counter (it is what the unit tests assert on);
+                // republish it for the dashboard. A 10s cadence is ample for an
+                // indicator that answers "has anything ever arrived on the
+                // forward", which is the question a stale port number raises.
+                if config.forward.is_some() {
+                    if let Ok(mut st) = shared.status.lock() {
+                        st.forwarded_in = nat.forwarded_in();
+                    }
                 }
             }
         }
@@ -970,6 +1199,195 @@ mod tests {
         assert_eq!(back[16..20], HOST.octets());
         assert_eq!(u16::from_be_bytes([back[22], back[23]]), 40000);
         assert!(hdr_ok(&back) && tcp_ok(&back));
+    }
+
+    /// The port a provider forwards. Deliberately inside `PORT_LO..PORT_HI` —
+    /// that overlap is the whole reason the allocator has to reserve it.
+    const FWD: u16 = 51413;
+
+    fn forwarding_nat() -> Nat {
+        let mut nat = Nat::new(WG);
+        nat.set_forward(HOST, FWD);
+        nat
+    }
+
+    fn settings_with(port_forward: Option<PortForward>) -> WgSettings {
+        // 32 zero bytes: the keys only have to decode, not be secret.
+        let key = "A".repeat(43) + "=";
+        WgSettings {
+            private_key: key.clone(),
+            public_key: key,
+            endpoint: "203.0.113.10:51820".to_string(),
+            address: "10.2.0.2".to_string(),
+            preshared_key: None,
+            persistent_keepalive: 25,
+            port_forward,
+        }
+    }
+
+    #[test]
+    fn the_gateway_is_derived_from_our_own_tunnel_address() {
+        // NAT-PMP has no discovery, and the host's routing table cannot answer
+        // this — the engine pointed the default route at its own TUN.
+        assert_eq!(tunnel_gateway(Ipv4Addr::new(10, 2, 0, 2)), Ipv4Addr::new(10, 2, 0, 1));
+        assert_eq!(tunnel_gateway(Ipv4Addr::new(10, 66, 43, 250)), Ipv4Addr::new(10, 66, 43, 1));
+    }
+
+    #[test]
+    fn each_port_forward_setting_resolves_to_the_right_plan() {
+        let leased = WgConfig::from_settings(
+            &settings_with(Some(PortForward::Leased(Method::NatPmp))),
+            HOST,
+        )
+        .unwrap();
+        match leased.forward {
+            Some(ForwardPlan::Leased { host, gateway }) => {
+                assert_eq!(host, HOST, "inbound must land on the host's TUN address");
+                assert_eq!(gateway, Ipv4Addr::new(10, 2, 0, 1));
+            }
+            _ => panic!("nat-pmp did not resolve to a leased plan"),
+        }
+
+        let fixed =
+            WgConfig::from_settings(&settings_with(Some(PortForward::Fixed(51413))), HOST).unwrap();
+        match fixed.forward {
+            Some(ForwardPlan::Fixed { host, port }) => {
+                assert_eq!((host, port), (HOST, 51413));
+            }
+            _ => panic!("a number did not resolve to a fixed plan"),
+        }
+
+        assert!(WgConfig::from_settings(&settings_with(None), HOST).unwrap().forward.is_none());
+        // Port 0 fails loudly rather than disabling the feature in silence.
+        assert!(WgConfig::from_settings(&settings_with(Some(PortForward::Fixed(0))), HOST).is_err());
+    }
+
+    #[test]
+    fn a_peer_reaches_the_forwarded_port_unsolicited() {
+        // The contrast with `unsolicited_inbound_is_dropped`: same shape of
+        // packet, arriving with no prior outbound, accepted because this one port
+        // is forwarded and nothing else is.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+
+        let mut inbound = tcp_packet(SERVER, WG, 6881, FWD, 0x02);
+        assert_eq!(nat.translate_in(&mut inbound, now), Verdict::Translate);
+        assert_eq!(inbound[16..20], HOST.octets(), "not delivered to the host");
+        assert_eq!(
+            u16::from_be_bytes([inbound[22], inbound[23]]),
+            FWD,
+            "the forwarded port is the same number on both sides"
+        );
+        assert!(hdr_ok(&inbound) && tcp_ok(&inbound));
+        assert_eq!(nat.forwarded_in(), 1);
+
+        // Every other port is still shut.
+        let mut other = tcp_packet(SERVER, WG, 6881, FWD + 1, 0x02);
+        assert_eq!(nat.translate_in(&mut other, now), Verdict::Drop);
+        assert_eq!(nat.forwarded_in(), 1);
+    }
+
+    #[test]
+    fn a_reply_from_the_forwarded_port_keeps_its_external_port() {
+        // The one that fails silently. The rotating allocator would renumber this
+        // reply, so the peer would be answered from a port it never dialled: TCP
+        // resets, uTP ignores, and inbound looks like it arrives but never
+        // connects. The source port must survive untouched.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+
+        let mut reply = tcp_packet(HOST, SERVER, FWD, 6881, 0x12);
+        assert_eq!(nat.translate_out(&mut reply, now), Verdict::Translate);
+        assert_eq!(reply[12..16], WG.octets(), "source address not translated");
+        assert_eq!(
+            u16::from_be_bytes([reply[20], reply[21]]),
+            FWD,
+            "the forwarded port was renumbered by the allocator"
+        );
+        assert!(hdr_ok(&reply) && tcp_ok(&reply));
+        // And it consumed no binding: the mapping is static.
+        assert_eq!(nat.bindings(), 0);
+    }
+
+    #[test]
+    fn two_peers_share_one_forwarded_mapping() {
+        // A cone mapping: endpoint-independent, unlike every other mapping here.
+        // A swarm is many peers on one listening port, so a per-peer mapping
+        // would defeat the purpose.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+        let peer_b = Ipv4Addr::new(1, 1, 1, 1);
+
+        let mut a = tcp_packet(HOST, SERVER, FWD, 6881, 0x10);
+        let mut b = tcp_packet(HOST, peer_b, FWD, 6881, 0x10);
+        nat.translate_out(&mut a, now);
+        nat.translate_out(&mut b, now);
+        assert_eq!(u16::from_be_bytes([a[20], a[21]]), FWD);
+        assert_eq!(u16::from_be_bytes([b[20], b[21]]), FWD);
+        assert_eq!(nat.bindings(), 0);
+    }
+
+    #[test]
+    fn the_carve_out_leaves_every_other_port_symmetric() {
+        // The exception must be exactly one port wide. Same assertion as
+        // `same_local_port_to_two_servers_gets_two_bindings`, made with
+        // forwarding live: a cone mapping leaking into the general case would
+        // collapse two conversations onto one external port.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+        let other = Ipv4Addr::new(1, 1, 1, 1);
+
+        let mut a = tcp_packet(HOST, SERVER, 40000, 443, 0x02);
+        let mut b = tcp_packet(HOST, other, 40000, 443, 0x02);
+        nat.translate_out(&mut a, now);
+        nat.translate_out(&mut b, now);
+        let (pa, pb) = (
+            u16::from_be_bytes([a[20], a[21]]),
+            u16::from_be_bytes([b[20], b[21]]),
+        );
+        assert_ne!(pa, pb, "forwarding collapsed two flows onto one port");
+        assert_ne!(pa, 40000);
+        assert_eq!(nat.bindings(), 2);
+    }
+
+    #[test]
+    fn the_allocator_never_hands_out_the_forwarded_port() {
+        // `FWD` sits inside the allocation range, so without the reservation an
+        // ordinary outbound flow would eventually be given it — and then inbound
+        // for the forward and inbound for that flow are the same packet.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+        // Walk the cursor across the forwarded number and well past it.
+        for i in 0..600u16 {
+            nat.next_port = FWD.wrapping_sub(300).wrapping_add(i).max(PORT_LO);
+            let mut p = tcp_packet(HOST, SERVER, 20000 + i, 443, 0x02);
+            if nat.translate_out(&mut p, now) == Verdict::Translate {
+                assert_ne!(
+                    u16::from_be_bytes([p[20], p[21]]),
+                    FWD,
+                    "allocator handed out the forwarded port"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forward_outlives_the_idle_sweep() {
+        // Nothing refreshes a static mapping — no conversation created it — so an
+        // expiry keyed on last-seen would collect it on the first quiet minute.
+        let mut nat = forwarding_nat();
+        let now = Instant::now();
+        let mut inbound = tcp_packet(SERVER, WG, 6881, FWD, 0x02);
+        assert_eq!(nat.translate_in(&mut inbound, now), Verdict::Translate);
+
+        nat.expire(now + TCP_IDLE + Duration::from_secs(60));
+
+        let mut again = tcp_packet(SERVER, WG, 6881, FWD, 0x02);
+        assert_eq!(
+            nat.translate_in(&mut again, now + TCP_IDLE + Duration::from_secs(61)),
+            Verdict::Translate,
+            "the forward was swept away with the idle bindings"
+        );
     }
 
     #[test]

@@ -13,6 +13,13 @@ mod inspect;
 mod killswitch;
 mod pin;
 mod preflight;
+/// The inbound port lease is engine machinery, not dashboard machinery: the
+/// exit driver installs what it negotiates, headless or not.
+mod portmap;
+/// Active probes are driven from the dashboard only, so the module follows the
+/// GUI feature rather than sitting dead in a headless build.
+#[cfg(feature = "gui")]
+mod probe;
 mod route;
 mod settings;
 mod state;

@@ -51,6 +51,40 @@ pub struct WgSettings {
     /// Persistent keepalive seconds (0 = off).
     #[serde(default = "default_wg_keepalive")]
     pub persistent_keepalive: u16,
+    /// How an inbound port is obtained, if one is wanted at all. Absent (the
+    /// default) is outbound-only, which is what any NAT does; present opens
+    /// exactly one port and nothing else.
+    ///
+    /// It lives here rather than on `Settings` because it is meaningless without
+    /// a remote exit — under Direct there is no provider forwarding anything and
+    /// no address a peer could dial. On the WireGuard section, that is
+    /// unconfigurable rather than a runtime error.
+    #[serde(default)]
+    pub port_forward: Option<PortForward>,
+}
+
+/// Where the forwarded port comes from.
+///
+/// Written as one field with two shapes rather than two fields, because
+/// `port_forward` and `forward_port` side by side would be a misreading waiting
+/// to happen — and the two are mutually exclusive, which a single field states
+/// and a pair of them only documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PortForward {
+    /// `port_forward = 51413` — a port the provider assigned out of band and
+    /// holds indefinitely. Rare. Most providers lease, including Proton, where a
+    /// number pasted in here forwards nothing at all.
+    Fixed(u16),
+    /// `port_forward = "nat-pmp"` — leased from the exit gateway and renewed for
+    /// the life of the session.
+    Leased(Method),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Method {
+    NatPmp,
 }
 
 fn default_wg_keepalive() -> u16 {
@@ -133,6 +167,29 @@ dns = "1.1.1.1"         # resolver pinned to the TUN under full-tunnel; must be
 # address     = "10.2.0.2"
 # preshared_key = "CCCC...=="
 # persistent_keepalive = 25
+#
+# Inbound port forwarding (optional). Without it the tunnel is outbound-only,
+# which is what any NAT is: peers cannot open connections TO you.
+#
+#   port_forward = "nat-pmp"   lease a port from the exit gateway and keep
+#                              renewing it. This is what Proton does — generate
+#                              the WireGuard config with NAT-PMP enabled, and
+#                              the port is negotiated at runtime. There is no
+#                              port number to copy from anywhere.
+#   port_forward = 51413       a port the provider assigned out of band and holds
+#                              indefinitely. Rare. On Proton this forwards
+#                              nothing: their ports are always leases.
+#
+# The port is the same number on both sides, so set your application to listen on
+# it (qBittorrent: Connection -> Listening Port, UPnP/NAT-PMP left OFF — this
+# engine does the leasing). The dashboard header shows the port and a count of
+# packets that have actually arrived on it; a count stuck at zero means the
+# forward is not live, whatever the port says.
+#
+# You will also need a Windows Firewall inbound rule for your application on the
+# tunnel adapter's profile — packets reach the engine and are dropped after it
+# otherwise, which reads as a working forward with no peers.
+# port_forward = "nat-pmp"
 "#;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -142,4 +199,76 @@ dns = "1.1.1.1"         # resolver pinned to the TUN under full-tunnel; must be
     std::fs::write(path, content)?;
     println!("Settings created at: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wg_with(line: &str) -> Result<Settings, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            [wireguard]
+            private_key = "aaaa"
+            public_key = "bbbb"
+            endpoint = "203.0.113.10:51820"
+            address = "10.2.0.2"
+            {line}
+            "#
+        ))
+    }
+
+    fn forward_of(s: &Settings) -> Option<PortForward> {
+        s.wireguard.as_ref().and_then(|w| w.port_forward)
+    }
+
+    #[test]
+    fn port_forward_reads_both_of_its_shapes() {
+        // An untagged enum silently picks the first variant that fits, so which
+        // TOML scalar lands on which arm is worth stating rather than assuming.
+        assert_eq!(
+            forward_of(&wg_with(r#"port_forward = "nat-pmp""#).unwrap()),
+            Some(PortForward::Leased(Method::NatPmp))
+        );
+        assert_eq!(
+            forward_of(&wg_with("port_forward = 51413").unwrap()),
+            Some(PortForward::Fixed(51413))
+        );
+        // Absent is outbound-only, which is the default a NAT gives you.
+        assert_eq!(forward_of(&wg_with("").unwrap()), None);
+    }
+
+    #[test]
+    fn a_misspelled_port_forward_is_refused_rather_than_ignored() {
+        // The failure mode this guards is the expensive one: a config that parses
+        // and quietly forwards nothing looks exactly like a provider outage, and
+        // this whole feature is unobservable until a peer tries to connect.
+        for bad in [
+            r#"port_forward = "natpmp""#,
+            r#"port_forward = "nat_pmp""#,
+            r#"port_forward = "NAT-PMP""#,
+            r#"port_forward = "upnp""#,
+            "port_forward = true",
+            "port_forward = 70000",
+            "port_forward = -1",
+        ] {
+            assert!(wg_with(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn the_starter_config_this_ships_actually_parses() {
+        // The template is a literal, so nothing else would catch a typo in it,
+        // and it is the first thing a new user runs.
+        let dir = std::env::temp_dir().join(format!("tunnel-cfg-{}", std::process::id()));
+        let path = dir.join("tunnel.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        init_config(&path).unwrap();
+        let parsed = Settings::load_or_default(&path).unwrap();
+        assert_eq!(parsed.tun_ip, Settings::default().tun_ip);
+        assert!(parsed.wireguard.is_none(), "the template's [wireguard] is commented out");
+        // Refuses to clobber an existing file.
+        assert!(init_config(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

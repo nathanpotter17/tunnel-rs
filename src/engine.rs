@@ -86,7 +86,7 @@ pub async fn run(
     // Resolve the exit before anything is installed, so a malformed WireGuard
     // config costs one message instead of a half-configured network.
     let wg_config = match &settings.wireguard {
-        Some(wg) => Some(crate::wg::WgConfig::from_settings(wg)?),
+        Some(wg) => Some(crate::wg::WgConfig::from_settings(wg, settings.tun_ip)?),
         None => None,
     };
     let exit_label = match &settings.wireguard {
@@ -234,6 +234,7 @@ pub async fn run(
         st.running = true;
         st.exit = exit_label;
         st.full_tunnel = install_route;
+        st.dns = Some(settings.dns);
         st.started_at = Some(StdInstant::now());
     }
 
