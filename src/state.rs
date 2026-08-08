@@ -22,6 +22,25 @@ pub struct ExitStats {
     pub written: AtomicU64,
 }
 
+/// Where the inbound forwarded port stands.
+///
+/// An enum rather than a port and an error side by side, because those two
+/// admit combinations that cannot happen — open *and* failed — and because the
+/// state that matters most has no value at all: a lease is negotiated over
+/// several seconds, and for that stretch there is neither a port nor a fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Forward {
+    /// Being negotiated. Not a failure: the first attempt of a session races
+    /// the WireGuard handshake and the route table, and losing that race is
+    /// ordinary. The string says what is being waited on.
+    Requesting(String),
+    /// Leased, or fixed in the config, and open on this port.
+    Open(u16),
+    /// Given up on after repeated attempts. The string is the reason, usually
+    /// the gateway's own.
+    Failed(String),
+}
+
 /// Where this session's artifacts are written.
 ///
 /// One directory and one timestamp, resolved once at startup, so the flow CSV
@@ -85,14 +104,10 @@ pub struct Status {
     /// nobody asked.
     pub dns: Option<std::net::Ipv4Addr>,
     pub started_at: Option<Instant>,
-    /// The forwarded inbound port currently open, if any. Under a lease this is
-    /// written by the exit driver as the gateway grants and regrants it, so it
-    /// is what is actually open rather than what was configured.
-    pub forward_port: Option<u16>,
-    /// Why there is no forwarded port, when one was asked for. Distinguishes
-    /// "not configured" from "configured and failing", which `forward_port`
-    /// being `None` cannot.
-    pub forward_error: Option<String>,
+    /// Where the inbound forwarded port stands, or `None` when none was asked
+    /// for. Written by the exit driver as the gateway grants and regrants it, so
+    /// it is what is actually open rather than what was configured.
+    pub forward: Option<Forward>,
     /// Packets accepted through that port. Shown beside it because the port is
     /// assigned out of band and goes stale silently: on a working tunnel a count
     /// stuck at zero means the forward is not live, and nothing else tells the

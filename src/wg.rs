@@ -917,7 +917,7 @@ pub async fn route(
         Some(ForwardPlan::Fixed { host, port }) => {
             nat.set_forward(host, port);
             if let Ok(mut st) = shared.status.lock() {
-                st.forward_port = Some(port);
+                st.forward = Some(crate::state::Forward::Open(port));
             }
             info!("inbound port forwarding: :{} open to {} (fixed)", port, host);
             Some(host)
@@ -1034,15 +1034,21 @@ pub async fn route(
                             info!("inbound port forwarding: :{} open to {} (leased)", port, host);
                         }
                         if let Ok(mut st) = shared.status.lock() {
-                            st.forward_port = Some(port);
-                            st.forward_error = None;
+                            st.forward = Some(crate::state::Forward::Open(port));
+                        }
+                    }
+                    // Both close the port — an unforwarded one must not stay
+                    // open — but only one of them is a fault.
+                    crate::portmap::Event::Pending { reason } => {
+                        nat.clear_forward();
+                        if let Ok(mut st) = shared.status.lock() {
+                            st.forward = Some(crate::state::Forward::Requesting(reason));
                         }
                     }
                     crate::portmap::Event::Lost { reason } => {
                         nat.clear_forward();
                         if let Ok(mut st) = shared.status.lock() {
-                            st.forward_port = None;
-                            st.forward_error = Some(reason);
+                            st.forward = Some(crate::state::Forward::Failed(reason));
                         }
                     }
                 }

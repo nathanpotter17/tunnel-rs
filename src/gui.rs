@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use crate::inspect::TrafficSnapshot;
 use crate::probe;
-use crate::state::{Shared, Status};
+use crate::state::{Forward, Shared, Status};
 
 // ---------------------------------------------------------------------------
 // Layout constants
@@ -107,6 +107,10 @@ const MONO_THEME: Theme = Theme {
 /// one colour that must not be re-themed away.
 const ERROR_RED: Color32 = Color32::from_rgb(230, 90, 90);
 const OK_GREEN: Color32 = Color32::from_rgb(120, 200, 130);
+/// Amber, for in-progress: neither settled nor wrong. Out of [`Theme`] with the
+/// other two, because the difference between "working on it" and "broken" is
+/// the one thing a colour scheme must not be able to flatten.
+const WARN_AMBER: Color32 = Color32::from_rgb(225, 180, 90);
 
 impl Default for Theme {
     fn default() -> Self {
@@ -248,22 +252,54 @@ impl Default for FlowUi {
 #[derive(Default)]
 struct ProbeUi {
     target: String,
+    action: ProbeAction,
     record: ProbeRecord,
     server: String,
     /// Whether the resolver field has been filled from the engine's pinned
     /// resolver. Once seeded, an operator's own entry is never overwritten.
     server_seeded: bool,
+    port_mode: PortMode,
+    /// Custom port specification, only read when `port_mode` is `Custom`.
+    ports: String,
     job: Option<probe::Job>,
     last: Option<Result<probe::Outcome, String>>,
 }
 
-/// Newtype so [`ProbeUi`] can derive `Default` without `probe::RecordType`
-/// having to pick a default that only makes sense to the UI.
+/// Newtypes so [`ProbeUi`] can derive `Default` without `probe`'s enums having
+/// to pick defaults that only make sense to the UI.
 struct ProbeRecord(probe::RecordType);
+struct ProbeAction(probe::Action);
 
 impl Default for ProbeRecord {
     fn default() -> Self {
         ProbeRecord(probe::RecordType::Auto)
+    }
+}
+
+impl Default for ProbeAction {
+    fn default() -> Self {
+        ProbeAction(probe::Action::Nslookup)
+    }
+}
+
+/// Which ports a scan covers.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum PortMode {
+    /// The curated top-100 list. The default because it answers the question
+    /// in a couple of seconds.
+    #[default]
+    Top,
+    Custom,
+}
+
+impl PortMode {
+    const ALL: [PortMode; 2] = [PortMode::Top, PortMode::Custom];
+
+    fn label(self) -> &'static str {
+        match self {
+            PortMode::Top => "TOP 100",
+            PortMode::Custom => "CUSTOM",
+        }
     }
 }
 
@@ -493,6 +529,26 @@ const PROBE_COLS: [Col; 4] = [
 ];
 const PROBE_DATA_MIN: usize = 16;
 const PROBE_DATA_MAX: usize = 45;
+
+/// Scan results. SERVICE is sized for the longest name in `inspect`'s table
+/// (`shadowsocks`, 11) plus the gutter; BANNER takes the rest, capped so a
+/// chatty service does not push PORT and SERVICE into the left margin.
+const SCAN_COLS: [Col; 3] = [
+    Col::new("PORT", 7, false, 2),
+    Col::new("SERVICE", 14, false, 1),
+    Col::new("BANNER", 0, false, 0),
+];
+const SCAN_BANNER_MIN: usize = 10;
+const SCAN_BANNER_MAX: usize = 60;
+
+/// The intel dossier. FIELD holds the longest label (`ALLOCATED`, 9) plus the
+/// gutter; VALUE is sized for an org name, which is the long one.
+const INTEL_COLS: [Col; 2] = [
+    Col::new("FIELD", 11, false, 1),
+    Col::new("VALUE", 0, false, 0),
+];
+const INTEL_VALUE_MIN: usize = 16;
+const INTEL_VALUE_MAX: usize = 64;
 
 /// Lay a value out in exactly `width` characters, one of which is a gutter.
 ///
@@ -1005,53 +1061,52 @@ fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, 
                 );
             }
 
-            // Three states, because they need three different actions from the
-            // operator and only one of them is a fault:
+            // Four states, because each asks something different of the operator
+            // and only one of them is a fault:
             //
-            //   FWD ERR     no lease at all — the reason says what to fix
-            //   FWD :P IDLE leased, but nothing has ever arrived on it
-            //   FWD :P n    leased and carrying inbound
+            //   FWD REQ     amber  — negotiating; nothing to do but wait
+            //   FWD ERR     red    — gave up; the hover says what to fix
+            //   FWD :P IDLE muted  — leased, but nothing has arrived on it
+            //   FWD :P n    white  — leased and carrying inbound
             //
-            // IDLE is muted rather than red: a port nobody has dialled yet looks
-            // exactly like one that forwards nothing, and calling that an error
-            // would cry wolf on every quiet start.
-            match (status.forward_port, &status.forward_error) {
-                (_, Some(err)) => {
-                    ui.add_space(GAP * 2.0);
-                    ui.label(
-                        egui::RichText::new("FWD ERR")
-                            .color(ERROR_RED)
-                            .size(MONO_PT)
-                            .monospace(),
-                    )
-                    .on_hover_text(err.clone());
-                }
-                (Some(port), None) => {
-                    let live = status.forwarded_in > 0;
-                    ui.add_space(GAP * 2.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "FWD :{port} {}",
-                            if live {
-                                format!("{}", status.forwarded_in)
-                            } else {
-                                "IDLE".into()
-                            }
-                        ))
-                        .color(if live { theme.text_primary } else { theme.text_muted })
-                        .size(MONO_PT)
-                        .monospace(),
-                    )
-                    .on_hover_text(if live {
-                        "inbound packets accepted on the forwarded port".to_string()
-                    } else {
+            // REQ exists because a lease takes seconds to negotiate and the
+            // first attempt races the WireGuard handshake. Painting that red
+            // reported a failure on every startup that then resolved itself.
+            //
+            // IDLE stays muted for the mirror-image reason: a port nobody has
+            // dialled yet looks exactly like one that forwards nothing, and
+            // calling that an error would cry wolf on every quiet start.
+            if let Some(forward) = &status.forward {
+                let live = status.forwarded_in > 0;
+                let (text, colour, hover) = match forward {
+                    Forward::Requesting(what) => (
+                        "FWD REQ".to_string(),
+                        WARN_AMBER,
+                        what.clone(),
+                    ),
+                    Forward::Failed(why) => ("FWD ERR".to_string(), ERROR_RED, why.clone()),
+                    Forward::Open(port) if live => (
+                        format!("FWD :{port} {}", status.forwarded_in),
+                        theme.text_primary,
+                        "inbound packets accepted on the forwarded port".to_string(),
+                    ),
+                    Forward::Open(port) => (
+                        format!("FWD :{port} IDLE"),
+                        theme.text_muted,
                         "the port is leased but nothing has arrived on it — check the \
                          application listens on this exact port, and that the firewall \
                          permits inbound on the tunnel adapter"
-                            .to_string()
-                    });
-                }
-                (None, None) => {}
+                            .to_string(),
+                    ),
+                };
+                ui.add_space(GAP * 2.0);
+                ui.label(
+                    egui::RichText::new(text)
+                        .color(colour)
+                        .size(MONO_PT)
+                        .monospace(),
+                )
+                .on_hover_text(hover);
             }
 
             let total = traffic.total_up + traffic.total_down;
@@ -1385,6 +1440,10 @@ fn render_probe(
         if let Some(result) = job.take() {
             p.last = Some(result);
             p.job = None;
+        } else if let Some(partial) = job.snapshot() {
+            // A scan republishes after every port, so the table fills in as the
+            // sweep runs instead of appearing all at once ten seconds later.
+            p.last = Some(partial);
         }
     }
 
@@ -1392,21 +1451,29 @@ fn render_probe(
     let wide = ui.available_width() >= 420.0;
     let mut go = false;
 
-    // Both control rows are laid out from the same total, so their left and
-    // right edges line up with each other and with the table below: the
+    // Both control rows are laid out from one total, so their edges line up with
+    // each other and with the table below whichever action is selected — the
     // fixed-width controls anchor the ends and the text field takes the slack.
-    //   row 1:  [ target .................. ][ ACTIVE ]
-    //   row 2:  [ AUTO ][ resolver .......... ][ LOOKUP ]
+    //
+    //   row 1            [ target ........................ ][ ACTIVE ▼ ]
+    //   row 2  LOOKUP    [ ACTION ▼ ][ AUTO ▼ ][ resolver .. ][ RUN ]
+    //          SCAN      [ ACTION ▼ ][ TOP 100 ▼ ][ ports ... ][ RUN ]
+    //          INTEL     [ ACTION ▼ ][ resolver ............ ][ RUN ]
+    //
     // Sized in absolute terms rather than by letting each widget claim what it
     // wants, which is what left the two rows ragged against one another.
+    let action = p.action.0;
+    let has_sub = !matches!(action, probe::Action::Intel);
     let full_w = ui.available_width();
     let combo_w = 76.0;
     let button_w = 62.0;
     let target_w = (full_w - combo_w - GAP).max(60.0);
-    let server_w = (full_w - combo_w - button_w - 2.0 * GAP).max(60.0);
-    // Narrow: the resolver field is dropped, so the type selector and the button
-    // are the whole row and the target field spans the width above them.
-    let server_w = if wide { server_w } else { 0.0 };
+    let selectors = if has_sub { 2.0 } else { 1.0 };
+    let field_w =
+        (full_w - selectors * (combo_w + GAP) - button_w - GAP).max(60.0);
+    // Narrow: the free-text field goes and the selectors plus the button are the
+    // whole row, with the target field spanning the width above them.
+    let field_w = if wide { Some(field_w) } else { None };
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
@@ -1433,7 +1500,12 @@ fn render_probe(
                     );
                 }
                 for h in &traffic.hosts {
-                    let line = format!("{:<22}{:>9} {}", truncate(&h.ip, 22), format_bytes_short(h.up + h.down), h.app);
+                    let line = format!(
+                        "{:<22}{:>9} {}",
+                        truncate(&h.ip, 22),
+                        format_bytes_short(h.up + h.down),
+                        h.app
+                    );
                     if ui
                         .selectable_label(
                             p.target == h.ip,
@@ -1449,62 +1521,122 @@ fn render_probe(
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
-        egui::ComboBox::from_id_salt(("probe_type", wid))
+
+        egui::ComboBox::from_id_salt(("probe_action", wid))
             .selected_text(
-                egui::RichText::new(p.record.0.label())
-                    .color(theme.text_muted)
+                egui::RichText::new(action.label())
+                    .color(theme.text_secondary)
                     .size(9.0)
                     .monospace(),
             )
             .width(combo_w)
             .show_ui(ui, |ui| {
-                for option in probe::RecordType::ALL {
+                for option in probe::Action::ALL {
                     ui.selectable_value(
-                        &mut p.record.0,
+                        &mut p.action.0,
                         option,
                         egui::RichText::new(option.label()).size(MONO_PT).monospace(),
                     );
                 }
-            });
+            })
+            .response
+            .on_hover_text("a DNS lookup, a TCP port scan, or who owns the address");
 
-        if wide {
-            let edit = text_field(ui, &mut p.server, server_w, "resolver")
-                .on_hover_text("nameserver to ask; defaults to the resolver the tunnel pinned");
-            // An entry typed before the engine published its resolver is still
-            // the operator's choice: seeding must not come along later and
-            // overwrite it.
-            if edit.changed() {
-                p.server_seeded = true;
+        match action {
+            probe::Action::Nslookup => {
+                egui::ComboBox::from_id_salt(("probe_type", wid))
+                    .selected_text(
+                        egui::RichText::new(p.record.0.label())
+                            .color(theme.text_muted)
+                            .size(9.0)
+                            .monospace(),
+                    )
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for option in probe::RecordType::ALL {
+                            ui.selectable_value(
+                                &mut p.record.0,
+                                option,
+                                egui::RichText::new(option.label()).size(MONO_PT).monospace(),
+                            );
+                        }
+                    });
+            }
+            probe::Action::PortScan => {
+                egui::ComboBox::from_id_salt(("probe_ports", wid))
+                    .selected_text(
+                        egui::RichText::new(p.port_mode.label())
+                            .color(theme.text_muted)
+                            .size(9.0)
+                            .monospace(),
+                    )
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for option in PortMode::ALL {
+                            ui.selectable_value(
+                                &mut p.port_mode,
+                                option,
+                                egui::RichText::new(option.label()).size(MONO_PT).monospace(),
+                            );
+                        }
+                    });
+            }
+            probe::Action::Intel => {}
+        }
+
+        if let Some(w) = field_w {
+            match (action, p.port_mode) {
+                (probe::Action::PortScan, PortMode::Custom) => {
+                    text_field(ui, &mut p.ports, w, "22,80,443,8000-8100").on_hover_text(
+                        format!("ports and ranges, at most {} per scan", probe::MAX_SCAN_PORTS),
+                    );
+                }
+                (probe::Action::PortScan, PortMode::Top) => {
+                    // The list is fixed, so the row keeps its shape with a
+                    // statement of what will be swept rather than a dead field.
+                    mono_cell(
+                        ui,
+                        format!("{} well-known ports", probe::TOP_PORTS.len()),
+                        theme.text_muted,
+                    );
+                }
+                _ => {
+                    let edit = text_field(ui, &mut p.server, w, "resolver").on_hover_text(
+                        "nameserver to ask; defaults to the resolver the tunnel pinned",
+                    );
+                    // An entry typed before the engine published its resolver is
+                    // still the operator's choice: seeding must not come along
+                    // later and overwrite it.
+                    if edit.changed() {
+                        p.server_seeded = true;
+                    }
+                }
             }
         }
 
-        if ui
-            .add_enabled(
-                !busy,
-                egui::Button::new(
-                    egui::RichText::new(if busy { "…" } else { "LOOKUP" })
-                        .size(MONO_PT)
-                        .monospace(),
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(
+                        egui::RichText::new(if busy { "…" } else { "RUN" })
+                            .size(MONO_PT)
+                            .monospace(),
+                    )
+                    .min_size(Vec2::new(button_w, 0.0)),
                 )
-                .min_size(Vec2::new(button_w, 0.0)),
-            )
-            .clicked()
-        {
-            go = true;
-        }
+                .clicked()
+            {
+                go = true;
+            }
+        });
     });
 
     if go && !busy {
-        match parse_server(&p.server) {
-            Ok(server) => {
+        match build_request(p) {
+            Ok(req) => {
                 p.last = None;
-                p.job = Some(probe::spawn(probe::Request {
-                    action: probe::Action::Nslookup,
-                    target: p.target.clone(),
-                    record: p.record.0,
-                    server,
-                    timeout: probe::DEFAULT_TIMEOUT,
-                }));
+                p.job = Some(probe::spawn(req));
             }
             Err(e) => p.last = Some(Err(e)),
         }
@@ -1513,25 +1645,55 @@ fn render_probe(
     ui.add_space(ROW_GAP);
     probe_status(ui, p, theme);
 
-    if let Some(Ok(outcome)) = &p.last {
-        probe_answers(ui, wid, outcome, theme);
+    match &p.last {
+        Some(Ok(probe::Outcome::Dns(o))) => probe_answers(ui, wid, o, theme),
+        Some(Ok(probe::Outcome::Scan(o))) => scan_results(ui, wid, o, theme),
+        Some(Ok(probe::Outcome::Intel(o))) => intel_results(ui, wid, o, theme),
+        _ => {}
     }
 }
 
-/// One or two compact lines saying what happened, above the answers.
+/// Turn the widget's controls into a request, or say why it cannot.
+///
+/// The port list is parsed HERE rather than in the worker, so a bad
+/// specification is a message under the controls instead of a thread that
+/// starts and immediately fails — and so `MAX_SCAN_PORTS` is enforced before
+/// anything opens a socket.
+fn build_request(p: &ProbeUi) -> Result<probe::Request, String> {
+    let ports = match (p.action.0, p.port_mode) {
+        (probe::Action::PortScan, PortMode::Top) => probe::TOP_PORTS.to_vec(),
+        (probe::Action::PortScan, PortMode::Custom) => probe::parse_ports(&p.ports)?,
+        _ => Vec::new(),
+    };
+    Ok(probe::Request {
+        action: p.action.0,
+        target: p.target.clone(),
+        record: p.record.0,
+        server: parse_server(&p.server)?,
+        timeout: probe::DEFAULT_TIMEOUT,
+        ports,
+    })
+}
+
+/// One or two compact lines saying what happened, above the results.
 fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
+    // A scan publishes its own progress, so the generic pending line would only
+    // repeat what the line below already says, less precisely.
+    let scanning = matches!(&p.last, Some(Ok(probe::Outcome::Scan(_))));
     if let Some(job) = &p.job {
-        mono_cell(
-            ui,
-            format!("… {} ({:.1}s)", job.summary, job.elapsed().as_secs_f32()),
-            theme.text_secondary,
-        );
-        return;
+        if !scanning {
+            mono_cell(
+                ui,
+                format!("… {} ({:.1}s)", job.summary, job.elapsed().as_secs_f32()),
+                theme.text_secondary,
+            );
+            return;
+        }
     }
     match &p.last {
         None => mono_cell(
             ui,
-            "pick a host or type a name, then LOOKUP".to_string(),
+            "pick a host or type a name, then RUN".to_string(),
             theme.text_muted,
         ),
         Some(Err(e)) => {
@@ -1543,7 +1705,9 @@ fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
             )
             .on_hover_text(e);
         }
-        Some(Ok(o)) => {
+        Some(Ok(probe::Outcome::Scan(o))) => scan_status(ui, o, theme),
+        Some(Ok(probe::Outcome::Intel(o))) => intel_status(ui, o, theme),
+        Some(Ok(probe::Outcome::Dns(o))) => {
             let ok = o.rcode == "NOERROR" && !o.answers.is_empty();
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -1586,7 +1750,143 @@ fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
     }
 }
 
-fn probe_answers(ui: &mut egui::Ui, wid: u64, outcome: &probe::Outcome, theme: &Theme) {
+/// Progress and totals for a scan. Rendered while it runs as well as after, so
+/// the counts are the pending indicator.
+fn scan_status(ui: &mut egui::Ui, o: &probe::ScanOutcome, theme: &Theme) {
+    let complete = o.complete();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        mono_cell(
+            ui,
+            format!("{:<9}", format!("{} OPEN", o.open.len())),
+            if o.open.is_empty() { theme.text_secondary } else { OK_GREEN },
+        );
+        mono_cell(
+            ui,
+            format!(
+                "{:>4}/{:<5} {:>5} ms  {} closed  {} filtered",
+                o.done,
+                o.total,
+                o.elapsed.as_millis(),
+                o.closed,
+                o.filtered
+            ),
+            theme.text_secondary,
+        );
+    });
+    ui.label(
+        egui::RichText::new(truncate(
+            &format!(
+                "{} {}",
+                o.target,
+                if complete { "scan complete" } else { "scanning…" }
+            ),
+            120,
+        ))
+        .color(theme.text_muted)
+        .size(9.0)
+        .monospace(),
+    );
+}
+
+fn intel_status(ui: &mut egui::Ui, o: &probe::IntelOutcome, theme: &Theme) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let known = o.asn.is_some();
+        mono_cell(
+            ui,
+            format!(
+                "{:<9}",
+                o.asn.map(|n| format!("AS{n}")).unwrap_or_else(|| "NO ASN".into())
+            ),
+            if known { OK_GREEN } else { ERROR_RED },
+        );
+        mono_cell(
+            ui,
+            format!("{:>5} ms  {}", o.elapsed.as_millis(), o.target),
+            theme.text_secondary,
+        );
+    });
+    if let Some(note) = &o.note {
+        ui.label(
+            egui::RichText::new(truncate(note, 120))
+                .color(theme.text_muted)
+                .size(9.0)
+                .monospace(),
+        )
+        .on_hover_text(note);
+    }
+}
+
+/// Open ports. Closed and filtered are counted in the status line rather than
+/// listed: a hundred rows saying "nothing here" is not a finding.
+fn scan_results(ui: &mut egui::Ui, wid: u64, o: &probe::ScanOutcome, theme: &Theme) {
+    ui.add_space(ROW_GAP);
+    let plan = fit(&SCAN_COLS, char_budget(ui), SCAN_BANNER_MIN, SCAN_BANNER_MAX);
+    table_header(ui, &plan, theme);
+
+    if o.open.is_empty() {
+        empty_note(
+            ui,
+            if o.complete() { "no open ports found" } else { "scanning…" },
+            theme,
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt(("scan_scroll", wid))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for r in &o.open {
+                table_row(ui, &plan, |title| match title {
+                    "PORT" => (r.port.to_string(), theme.text_primary),
+                    "SERVICE" => (r.service.to_string(), theme.text_secondary),
+                    _ => match &r.banner {
+                        Some(b) => (b.clone(), theme.text_muted),
+                        None => ("—".to_string(), theme.text_muted),
+                    },
+                });
+            }
+        });
+}
+
+/// The dossier. Only fields that came back are listed — an absent ASN is a
+/// missing row, not an empty one, so the panel never pads itself with unknowns.
+fn intel_results(ui: &mut egui::Ui, wid: u64, o: &probe::IntelOutcome, theme: &Theme) {
+    ui.add_space(ROW_GAP);
+    let plan = fit(&INTEL_COLS, char_budget(ui), INTEL_VALUE_MIN, INTEL_VALUE_MAX);
+    table_header(ui, &plan, theme);
+
+    let mut rows: Vec<(&str, String)> = vec![("ADDRESS", o.target.clone())];
+    for (field, value) in [
+        ("PTR", o.ptr.clone()),
+        ("ASN", o.asn.map(|n| format!("AS{n}"))),
+        ("ORG", o.org.clone()),
+        ("PREFIX", o.prefix.clone()),
+        ("COUNTRY", o.country.clone()),
+        ("REGISTRY", o.registry.clone()),
+        ("ALLOCATED", o.allocated.clone()),
+    ] {
+        if let Some(v) = value {
+            rows.push((field, v));
+        }
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt(("intel_scroll", wid))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (field, value) in &rows {
+                table_row(ui, &plan, |title| match title {
+                    "FIELD" => ((*field).to_string(), theme.text_muted),
+                    _ => (value.clone(), theme.text_primary),
+                });
+            }
+        });
+}
+
+fn probe_answers(ui: &mut egui::Ui, wid: u64, outcome: &probe::DnsOutcome, theme: &Theme) {
     ui.add_space(ROW_GAP);
     let plan = fit(&PROBE_COLS, char_budget(ui), PROBE_DATA_MIN, PROBE_DATA_MAX);
     table_header(ui, &plan, theme);
@@ -2334,6 +2634,53 @@ mod tests {
         assert_eq!(narrow, ["NAME", "TYPE", "DATA"]);
     }
 
+    /// Render one row of `cols` as the character grid it becomes on screen.
+    fn grid_row(cols: &[Col], value: impl Fn(&str) -> String) -> String {
+        cols.iter()
+            .enumerate()
+            .map(|(i, c)| pad(&value(c.title), c.width, c.right, gutter(c, cols.get(i + 1))))
+            .collect()
+    }
+
+    #[test]
+    fn the_scan_and_intel_tables_read_as_separated_columns() {
+        // Same standard as the probe answer table: these are character grids, so
+        // the grid is the only honest check.
+        let scan = fit(&SCAN_COLS, 78, SCAN_BANNER_MIN, SCAN_BANNER_MAX);
+        assert_eq!(scan.iter().map(|c| c.width).sum::<usize>(), 78);
+        let row = grid_row(&scan, |t| match t {
+            "PORT" => "22".into(),
+            "SERVICE" => "ssh".into(),
+            _ => "SSH-2.0-OpenSSH_9.6".into(),
+        });
+        assert_eq!(row.trim_end(), "22     ssh           SSH-2.0-OpenSSH_9.6");
+        assert_eq!(
+            grid_row(&scan, |t| t.to_string()).trim_end(),
+            "PORT   SERVICE       BANNER"
+        );
+
+        // SERVICE must hold the longest name in inspect's table without an
+        // ellipsis, or the scan disagrees with the SERVICES widget about a port.
+        let service = scan.iter().find(|c| c.title == "SERVICE").unwrap();
+        assert_eq!(pad("shadowsocks", service.width, false, 1).trim_end(), "shadowsocks");
+
+        let intel = fit(&INTEL_COLS, 78, INTEL_VALUE_MIN, INTEL_VALUE_MAX);
+        assert_eq!(intel.iter().map(|c| c.width).sum::<usize>(), 78);
+        let dossier = grid_row(&intel, |t| match t {
+            "FIELD" => "ALLOCATED".into(),
+            _ => "1998-09-25".into(),
+        });
+        // FIELD renders wider than its base 11: VALUE saturates at its cap, and
+        // the leftover is spread across the other columns rather than pooling in
+        // the flexible one.
+        assert_eq!(dossier.trim_end(), "ALLOCATED     1998-09-25");
+        // The longest label this table uses must survive its column.
+        let field = intel.iter().find(|c| c.title == "FIELD").unwrap();
+        for label in ["ADDRESS", "PTR", "ASN", "ORG", "PREFIX", "COUNTRY", "REGISTRY", "ALLOCATED"] {
+            assert_eq!(pad(label, field.width, false, 1).trim_end(), label);
+        }
+    }
+
     #[test]
     fn every_cell_ends_in_a_gutter_so_columns_cannot_touch() {
         // The bug this pins: a right-aligned cell reserved its blank on the LEFT,
@@ -2597,6 +2944,12 @@ mod tests {
         for v in View::ALL {
             text.push_str(v.label());
         }
+        for a in probe::Action::ALL {
+            text.push_str(a.label());
+        }
+        for m in PortMode::ALL {
+            text.push_str(m.label());
+        }
         for s in Sort::ALL {
             text.push_str(s.label());
         }
@@ -2605,10 +2958,13 @@ mod tests {
         }
         for s in [
             "QUORUM IO", "[ON]", "[OFF]", "[ERR]", "CONNECTED", "ENGINE STOPPED", "OFFLINE",
-            "FWD IDLE ERR",
+            "FWD IDLE ERR REQ",
             // Protocol labels reach the screen from inspect.rs, so they belong
             // in this registry too — `uTP` is one keystroke from `µTP`.
             "BitTorrent uTP DHT BT Tracker Obfuscated WireGuard OpenVPN Shadowsocks",
+            "PORT SERVICE BANNER FIELD VALUE ADDRESS PTR ASN ORG PREFIX COUNTRY REGISTRY",
+            "ALLOCATED OPEN closed filtered scanning scan complete TOP 100 CUSTOM RUN",
+            "well-known ports no open ports found",
             "LOOKUP", "ACTIVE", "filter", "live only", "resolver", "host or address",
             "no active hosts", "no traffic yet", "no flows match the filter", "no widgets",
             "no remote hosts yet", "no services yet", "no classified traffic yet",
@@ -2679,6 +3035,56 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The colour of the header's forward indicator, read back out of the
+    /// frame's painted text rather than recomputed.
+    fn forward_colour(app: &mut TunnelApp) -> Option<Color32> {
+        render_frame(app, 1280.0, 800.0)
+            .shapes
+            .into_iter()
+            .find_map(|c| match c.shape {
+                egui::Shape::Text(t) if t.galley.job.text.starts_with("FWD") => {
+                    t.galley.job.sections.first().map(|s| s.format.color)
+                }
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn the_forward_indicator_tells_waiting_apart_from_failing() {
+        // A lease takes seconds to negotiate and its first attempt races the
+        // WireGuard handshake. Painting that red reported a failure on every
+        // startup which then resolved itself — so "requesting" is its own state,
+        // and it must not drift back into meaning "broken".
+        let mut app = app();
+        app.traffic = Arc::new(populated());
+
+        assert_eq!(forward_colour(&mut app), None, "nothing shows when unconfigured");
+
+        app.status.forward = Some(Forward::Requesting("negotiating".into()));
+        assert_eq!(forward_colour(&mut app), Some(WARN_AMBER));
+
+        app.status.forward = Some(Forward::Failed("not authorised".into()));
+        assert_eq!(forward_colour(&mut app), Some(ERROR_RED));
+
+        // Leased but unproven is muted, not red: a port nobody has dialled looks
+        // the same as one that forwards nothing.
+        app.status.forward = Some(Forward::Open(51413));
+        app.status.forwarded_in = 0;
+        assert_eq!(forward_colour(&mut app), Some(MONO_THEME.text_muted));
+
+        app.status.forwarded_in = 42;
+        assert_eq!(forward_colour(&mut app), Some(MONO_THEME.text_primary));
+
+        // Four states, four distinct colours — the whole point is telling them
+        // apart at a glance.
+        let seen = [WARN_AMBER, ERROR_RED, MONO_THEME.text_muted, MONO_THEME.text_primary];
+        for (i, a) in seen.iter().enumerate() {
+            for b in &seen[i + 1..] {
+                assert_ne!(a, b, "two states share a colour");
+            }
+        }
     }
 
     #[test]
@@ -2822,7 +3228,7 @@ mod tests {
         render_frame(&mut app, 900.0, 400.0);
         app.rows[0].widgets[0].probe.last = Some(Err("no response from 9.9.9.9:53".into()));
         render_frame(&mut app, 900.0, 400.0);
-        app.rows[0].widgets[0].probe.last = Some(Ok(probe::Outcome {
+        app.rows[0].widgets[0].probe.last = Some(Ok(probe::Outcome::Dns(probe::DnsOutcome {
             question: "34.216.184.93.in-addr.arpa".into(),
             record: probe::RecordType::Ptr,
             server: "9.9.9.9:53".parse().unwrap(),
@@ -2837,10 +3243,54 @@ mod tests {
                 data: "example.com".into(),
             }],
             note: None,
-        }));
+        })));
         render_frame(&mut app, 900.0, 400.0);
         // ...including in a widget too narrow for the whole answer table.
         render_frame(&mut app, 460.0, 380.0);
+
+        // Every action's controls and every result shape must draw too — each
+        // has its own row layout and its own table, so a widget that renders
+        // one is no evidence about the others.
+        for action in probe::Action::ALL {
+            app.rows[0].widgets[0].probe.action = ProbeAction(action);
+            app.rows[0].widgets[0].probe.last = None;
+            render_frame(&mut app, 900.0, 400.0);
+            render_frame(&mut app, 460.0, 380.0);
+        }
+        app.rows[0].widgets[0].probe.port_mode = PortMode::Custom;
+        render_frame(&mut app, 900.0, 400.0);
+
+        app.rows[0].widgets[0].probe.last = Some(Ok(probe::Outcome::Scan(probe::ScanOutcome {
+            target: "93.184.216.34".parse().unwrap(),
+            done: 100,
+            total: 100,
+            elapsed: Duration::from_millis(2400),
+            open: vec![probe::PortResult {
+                port: 22,
+                service: "ssh",
+                banner: Some("SSH-2.0-OpenSSH_9.6".into()),
+            }],
+            closed: 97,
+            filtered: 2,
+        })));
+        render_frame(&mut app, 900.0, 400.0);
+        render_frame(&mut app, 460.0, 380.0);
+
+        app.rows[0].widgets[0].probe.last = Some(Ok(probe::Outcome::Intel(probe::IntelOutcome {
+            target: "93.184.216.34".into(),
+            ptr: Some("example.com".into()),
+            asn: Some(15133),
+            org: Some("EDGECAST, US".into()),
+            prefix: Some("93.184.216.0/24".into()),
+            country: Some("US".into()),
+            registry: Some("ripencc".into()),
+            allocated: Some("2008-06-02".into()),
+            elapsed: Duration::from_millis(88),
+            note: None,
+        })));
+        render_frame(&mut app, 900.0, 400.0);
+        render_frame(&mut app, 460.0, 380.0);
+        app.rows[0].widgets[0].probe.action = ProbeAction(probe::Action::Nslookup);
 
         // The resolver field seeds itself from the engine's pinned resolver, so
         // the probe asks what the rest of the host asks.

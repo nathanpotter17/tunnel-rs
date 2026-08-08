@@ -65,8 +65,9 @@ const SLEEP_SLICE: Duration = Duration::from_millis(500);
 /// several before WireGuard has handshaked — asking then reports a failure that
 /// is really just a session still coming up.
 const STARTUP_GRACE: Duration = Duration::from_secs(3);
-/// Failures tolerated quietly before the log escalates. A session that has not
-/// settled yet is not news; one that has stopped answering is.
+/// Failures tolerated before this is treated as a fault rather than a session
+/// still settling. Governs the log level and the dashboard's state together, so
+/// the two cannot disagree about when something has gone wrong.
 const QUIET_FAILURES: u32 = 2;
 
 /// Per-attempt read timeouts. RFC 6886 §3.1 specifies 250 ms doubling over nine
@@ -118,7 +119,12 @@ pub enum Event {
     /// A lease is live on this external port. Sent on every successful renewal,
     /// not only on change, so the driver's view cannot drift from the gateway's.
     Mapped { port: u16 },
-    /// No lease. The forwarded port must be closed until one is granted again.
+    /// No lease yet, and not yet a problem. Sent before the first request and
+    /// while early attempts fail, because the opening seconds of a session are
+    /// spent racing the WireGuard handshake and losing that race is ordinary.
+    Pending { reason: String },
+    /// No lease after repeated attempts. The forwarded port must be closed
+    /// until one is granted again.
     Lost { reason: String },
 }
 
@@ -362,6 +368,17 @@ fn lease_loop(gateway: Ipv4Addr, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBo
     let mut failures: u32 = 0;
 
     info!("portmap: leasing an inbound port from {} (NAT-PMP)", gateway);
+    // Say so before the grace period rather than after it: otherwise the widget
+    // shows nothing for three seconds and then a state, which reads as the
+    // feature having been off until it wasn't.
+    if tx
+        .blocking_send(Event::Pending {
+            reason: format!("negotiating an inbound port with {gateway}"),
+        })
+        .is_err()
+    {
+        return;
+    }
     sleep_interruptibly(STARTUP_GRACE, &shutdown);
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -402,13 +419,22 @@ fn lease_loop(gateway: Ipv4Addr, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBo
             }
             Err(reason) => {
                 failures += 1;
-                if failures <= QUIET_FAILURES {
+                announced = None;
+                // One threshold decides both how loudly this is logged and what
+                // the dashboard calls it, so the log and the widget cannot
+                // disagree about whether anything is actually wrong.
+                let settling = failures <= QUIET_FAILURES;
+                if settling {
                     debug!("portmap: {} (attempt {})", reason, failures);
                 } else {
                     warn!("portmap: {}", reason);
                 }
-                announced = None;
-                if tx.blocking_send(Event::Lost { reason }).is_err() {
+                let event = if settling {
+                    Event::Pending { reason }
+                } else {
+                    Event::Lost { reason }
+                };
+                if tx.blocking_send(event).is_err() {
                     break;
                 }
                 RETRY

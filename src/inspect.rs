@@ -1074,7 +1074,10 @@ struct PortAcc {
 /// Human name for a well-known remote port. Deliberately a superset of what
 /// `classify` fingerprints: this labels the *destination service* even when the
 /// flow's payload classification landed elsewhere (e.g. TLS on 993 is IMAPS).
-fn service_name(port: u16) -> &'static str {
+///
+/// Shared with `probe.rs`, which labels the ports a scan finds open. One table:
+/// a scan and the SERVICES widget must not disagree about what port 993 is.
+pub(crate) fn service_name(port: u16) -> &'static str {
     match port {
         20 | 21 => "ftp",
         22 => "ssh",

@@ -9,9 +9,18 @@
 //! host actually see, from where the tunnel actually is", not "what does the
 //! host's resolver stub have cached".
 //!
-//! The first (and so far only) action is nslookup. [`Action`] and
-//! [`RecordType`] are the two axes a new action plugs into: `Action` for a new
-//! *kind* of question, `RecordType` for another shape of this one.
+//! [`Action`] and [`RecordType`] are the two axes: `Action` for a new *kind* of
+//! question, `RecordType` for another shape of a lookup. Three actions today —
+//! `nslookup`, a TCP connect `scan`, and `intel`, which assembles an address's
+//! ownership from DNS alone.
+//!
+//! ## What this deliberately does not do
+//!
+//! No TLS. Reading a host's certificate means completing a handshake with the
+//! thing under examination and parsing its X.509, which is a whole new class of
+//! attacker-controlled input for a question `intel` mostly answers already.
+//! Scans read banners but never *send* application data: a service that
+//! announces itself is recorded, and one that does not is left alone.
 //!
 //! ## Parsing rules
 //!
@@ -56,18 +65,26 @@ const MAX_RDATA_CHARS: usize = 240;
 // Question shape
 // ---------------------------------------------------------------------------
 
-/// What a probe *does*. One variant today; the enum exists so the widget's
-/// dispatch and the job runner are already shaped for the next one.
+/// What a probe *does*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     /// Resolve a name (or reverse-resolve an address) against a nameserver.
     Nslookup,
+    /// TCP connect scan over a bounded port list.
+    PortScan,
+    /// Everything DNS alone can say about an address: reverse name, and the
+    /// ASN, prefix, country, registry and org behind it.
+    Intel,
 }
 
 impl Action {
+    pub const ALL: [Action; 3] = [Action::Nslookup, Action::PortScan, Action::Intel];
+
     pub fn label(self) -> &'static str {
         match self {
-            Action::Nslookup => "nslookup",
+            Action::Nslookup => "LOOKUP",
+            Action::PortScan => "SCAN",
+            Action::Intel => "INTEL",
         }
     }
 }
@@ -86,10 +103,16 @@ pub enum RecordType {
     Mx,
     Ns,
     Soa,
+    /// Which CAs the zone authorises to issue for it (RFC 8659). A statement of
+    /// policy, not of what a server is presenting — reading the actual
+    /// certificate would mean handshaking with it, which this module does not do.
+    Caa,
+    /// DANE certificate association (RFC 6698).
+    Tlsa,
 }
 
 impl RecordType {
-    pub const ALL: [RecordType; 9] = [
+    pub const ALL: [RecordType; 11] = [
         RecordType::Auto,
         RecordType::A,
         RecordType::Aaaa,
@@ -99,6 +122,8 @@ impl RecordType {
         RecordType::Mx,
         RecordType::Ns,
         RecordType::Soa,
+        RecordType::Caa,
+        RecordType::Tlsa,
     ];
 
     pub fn label(self) -> &'static str {
@@ -112,6 +137,8 @@ impl RecordType {
             RecordType::Mx => "MX",
             RecordType::Ns => "NS",
             RecordType::Soa => "SOA",
+            RecordType::Caa => "CAA",
+            RecordType::Tlsa => "TLSA",
         }
     }
 
@@ -136,6 +163,8 @@ impl RecordType {
             RecordType::Mx => 15,
             RecordType::Txt => 16,
             RecordType::Aaaa => 28,
+            RecordType::Tlsa => 52,
+            RecordType::Caa => 257,
         }
     }
 }
@@ -200,9 +229,13 @@ pub struct Request {
     pub record: RecordType,
     /// The nameserver to ask. Defaults to the resolver the engine pinned onto
     /// the TUN, so the probe exercises the same resolver the rest of the host
-    /// is using.
+    /// is using. `Intel` and a `PortScan` of a hostname use it too, so every
+    /// action agrees about what the target resolves to.
     pub server: SocketAddr,
     pub timeout: Duration,
+    /// Ports for [`Action::PortScan`], already parsed and capped by
+    /// [`parse_ports`]. Empty for every other action.
+    pub ports: Vec<u16>,
 }
 
 /// One record from a response, already rendered to text.
@@ -214,9 +247,83 @@ pub struct Answer {
     pub data: String,
 }
 
-/// A completed probe.
+/// What a probe produced. One variant per [`Action`] — the widget matches on it
+/// to pick a renderer, so a new action cannot forget to bring its own display.
 #[derive(Clone, Debug)]
-pub struct Outcome {
+pub enum Outcome {
+    Dns(DnsOutcome),
+    Scan(ScanOutcome),
+    Intel(IntelOutcome),
+}
+
+/// Whether a port answered, refused, or said nothing at all.
+///
+/// The three are genuinely different findings: `Closed` is a host that replied
+/// and declined, `Filtered` is silence, which is either a firewall or a path
+/// that never arrived.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PortState {
+    Open,
+    Closed,
+    Filtered,
+}
+
+/// One open port.
+#[derive(Clone, Debug)]
+pub struct PortResult {
+    pub port: u16,
+    /// From `inspect::service_name` — the same table the SERVICES widget uses,
+    /// so a scan and the flow table cannot disagree about what a port is.
+    pub service: &'static str,
+    /// What the service announced unprompted, escaped and clamped. `None` means
+    /// it stayed quiet, which is most things: nothing is ever *sent* to draw a
+    /// banner out.
+    pub banner: Option<String>,
+}
+
+/// A scan, complete or in flight. Republished as each port finishes, so a sweep
+/// that takes ten seconds is not ten seconds of blank widget.
+#[derive(Clone, Debug)]
+pub struct ScanOutcome {
+    pub target: IpAddr,
+    /// Ports finished so far, out of the whole list.
+    pub done: usize,
+    pub total: usize,
+    pub elapsed: Duration,
+    /// Open ports only. A hundred rows of "closed" is noise; the counts below
+    /// carry what the rest of the list said.
+    pub open: Vec<PortResult>,
+    pub closed: usize,
+    pub filtered: usize,
+}
+
+impl ScanOutcome {
+    pub fn complete(&self) -> bool {
+        self.done >= self.total
+    }
+}
+
+/// What DNS alone can say about an address.
+///
+/// Every field is optional and independent: a lookup that half-works still
+/// tells you something, and a dossier missing its org line beats an error.
+#[derive(Clone, Debug, Default)]
+pub struct IntelOutcome {
+    pub target: String,
+    pub ptr: Option<String>,
+    pub asn: Option<u32>,
+    pub prefix: Option<String>,
+    pub country: Option<String>,
+    pub registry: Option<String>,
+    pub allocated: Option<String>,
+    pub org: Option<String>,
+    pub elapsed: Duration,
+    pub note: Option<String>,
+}
+
+/// A completed lookup.
+#[derive(Clone, Debug)]
+pub struct DnsOutcome {
     /// The name actually put on the wire — for a reverse lookup this is the
     /// `in-addr.arpa` form, which is worth showing rather than hiding.
     pub question: String,
@@ -247,11 +354,23 @@ pub struct Outcome {
 /// would mean carrying a `Handle` into the dashboard so that one keystroke could
 /// borrow a worker from the packet path.
 pub struct Job {
-    slot: Arc<Mutex<Option<Result<Outcome, String>>>>,
+    slot: Arc<Mutex<Slot>>,
     started: Instant,
     /// What this job asked, for the "running" line in the UI.
     pub summary: String,
 }
+
+/// The worker's side of a job. `latest` carries partial results while a scan is
+/// still walking its port list; `done` says whether anything further will arrive.
+#[derive(Default)]
+struct Slot {
+    latest: Option<Result<Outcome, String>>,
+    done: bool,
+}
+
+/// A sink the running action publishes progress through. `Sync` because a scan
+/// hands it to every worker thread at once.
+type Publish<'a> = &'a (dyn Fn(Outcome) + Sync);
 
 impl Job {
     /// How long the probe has been running, for the pending indicator.
@@ -259,15 +378,25 @@ impl Job {
         self.started.elapsed()
     }
 
+    /// Read the latest result without consuming it. A scan republishes after
+    /// every port, so this is what makes a long sweep watchable.
+    pub fn snapshot(&self) -> Option<Result<Outcome, String>> {
+        self.with_slot(|s| s.latest.clone())
+    }
+
     /// Take the result if the probe has finished. Returns `None` while it is
     /// still in flight, so the caller can keep drawing a pending state.
     pub fn take(&self) -> Option<Result<Outcome, String>> {
+        self.with_slot(|s| if s.done { s.latest.take() } else { None })
+    }
+
+    /// A panic in the worker cannot poison anything the caller needs — the guard
+    /// holds plain data — so recover rather than wedge the widget on a
+    /// permanently pending job.
+    fn with_slot<T>(&self, f: impl FnOnce(&mut Slot) -> T) -> T {
         match self.slot.lock() {
-            Ok(mut s) => s.take(),
-            // A panic in the worker cannot poison anything the caller needs —
-            // the guard holds a plain Option — so recover rather than wedge the
-            // widget on a permanently pending job.
-            Err(e) => e.into_inner().take(),
+            Ok(mut s) => f(&mut s),
+            Err(e) => f(&mut e.into_inner()),
         }
     }
 }
@@ -276,33 +405,47 @@ impl Job {
 /// cannot be spawned is reported through the same slot as any other failure, so
 /// the UI has exactly one path to render.
 pub fn spawn(req: Request) -> Job {
-    let summary = format!("{} {} {}", req.action.label(), req.record.label(), req.target);
-    let slot: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
+    let summary = match req.action {
+        Action::Nslookup => format!("{} {} {}", req.action.label(), req.record.label(), req.target),
+        Action::PortScan => format!("{} {} ports {}", req.action.label(), req.ports.len(), req.target),
+        Action::Intel => format!("{} {}", req.action.label(), req.target),
+    };
+    let slot: Arc<Mutex<Slot>> = Arc::new(Mutex::new(Slot::default()));
     let sink = slot.clone();
 
     let spawned = std::thread::Builder::new()
         .name("probe".to_string())
         .spawn(move || {
-            let out = run(&req);
+            let progress = sink.clone();
+            let publish = move |o: Outcome| {
+                if let Ok(mut s) = progress.lock() {
+                    s.latest = Some(Ok(o));
+                }
+            };
+            let out = run_with(&req, &publish);
             if let Ok(mut s) = sink.lock() {
-                *s = Some(out);
+                s.latest = Some(out);
+                s.done = true;
             }
         });
 
     if let Err(e) = spawned {
         if let Ok(mut s) = slot.lock() {
-            *s = Some(Err(format!("could not start probe thread: {e}")));
+            s.latest = Some(Err(format!("could not start probe thread: {e}")));
+            s.done = true;
         }
     }
 
     Job { slot, started: Instant::now(), summary }
 }
 
-/// Execute a probe synchronously. Public so a caller outside the GUI (a test,
-/// or a future headless mode) can use the same path the dashboard does.
-pub fn run(req: &Request) -> Result<Outcome, String> {
+/// Execute a probe, publishing progress through `publish` as it goes. A caller
+/// with nothing to show progress on passes `&|_| {}` and gets the final result.
+fn run_with(req: &Request, publish: Publish) -> Result<Outcome, String> {
     match req.action {
-        Action::Nslookup => nslookup(req),
+        Action::Nslookup => nslookup(req).map(Outcome::Dns),
+        Action::PortScan => scan(req, publish).map(Outcome::Scan),
+        Action::Intel => intel(req).map(Outcome::Intel),
     }
 }
 
@@ -310,7 +453,7 @@ pub fn run(req: &Request) -> Result<Outcome, String> {
 // nslookup
 // ---------------------------------------------------------------------------
 
-fn nslookup(req: &Request) -> Result<Outcome, String> {
+fn nslookup(req: &Request) -> Result<DnsOutcome, String> {
     let target = req.target.trim();
     if target.is_empty() {
         return Err("no target: pick a host or type a name".to_string());
@@ -363,7 +506,7 @@ fn nslookup(req: &Request) -> Result<Outcome, String> {
         });
     }
 
-    Ok(Outcome {
+    Ok(DnsOutcome {
         question,
         record,
         server: req.server,
@@ -376,25 +519,336 @@ fn nslookup(req: &Request) -> Result<Outcome, String> {
     })
 }
 
-/// The `in-addr.arpa` / `ip6.arpa` name for an address.
-fn reverse_name(ip: IpAddr) -> String {
+/// An address's labels, least-significant first and without a zone suffix.
+///
+/// Split out because two different zones want the same reversal: `in-addr.arpa`
+/// for a PTR, and Team Cymru's `origin.asn.cymru.com` for an ASN. Writing the
+/// nibble expansion twice is how they would drift.
+fn reverse_labels(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
+            format!("{}.{}.{}.{}", o[3], o[2], o[1], o[0])
         }
         IpAddr::V6(v6) => {
-            let mut s = String::with_capacity(72);
+            let mut s = String::with_capacity(64);
             for byte in v6.octets().iter().rev() {
                 s.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
                 s.push('.');
                 s.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
                 s.push('.');
             }
-            s.push_str("ip6.arpa");
+            s.pop(); // the trailing separator; the caller supplies the zone
             s
         }
     }
+}
+
+/// The `in-addr.arpa` / `ip6.arpa` name for an address.
+fn reverse_name(ip: IpAddr) -> String {
+    let zone = match ip {
+        IpAddr::V4(_) => "in-addr.arpa",
+        IpAddr::V6(_) => "ip6.arpa",
+    };
+    format!("{}.{}", reverse_labels(ip), zone)
+}
+
+// ---------------------------------------------------------------------------
+// Port scan
+// ---------------------------------------------------------------------------
+
+/// Ports one scan may cover.
+///
+/// This cap is a NAT-table budget, not a preference. A port that never answers
+/// leaves a binding behind for `wg.rs`'s `TCP_IDLE` — ten minutes — so a scan's
+/// worst case is its whole list held against `MAX_BINDINGS` (16384) for that
+/// long. At 1024 that is 6%; the default list is 0.6%. Raising this without
+/// re-reading `wg.rs`'s expiry is how a scan starts shedding real traffic.
+pub const MAX_SCAN_PORTS: usize = 1024;
+
+/// Connections in flight at once. Bounds the *instantaneous* flow count, which
+/// is what `conn.rs` admission control charges against its memory budget under
+/// the Direct exit — each live TCP flow there owns a real send/receive buffer.
+const SCAN_CONCURRENCY: usize = 16;
+
+/// Per-port connect budget. Shorter than [`DEFAULT_TIMEOUT`]: a scan spends this
+/// once per filtered port, and the list is long.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// How long an open port is given to introduce itself. Nothing is sent, so this
+/// is pure listening and most services will not use it.
+const BANNER_TIMEOUT: Duration = Duration::from_millis(600);
+const BANNER_BYTES: usize = 256;
+const BANNER_CHARS: usize = 120;
+
+/// The ports worth trying first — nmap's top-100 TCP, which is the empirical
+/// answer to "what is actually listening on the internet".
+pub const TOP_PORTS: [u16; 100] = [
+    7, 9, 13, 21, 22, 23, 25, 26, 37, 53, 79, 80, 81, 88, 106, 110, 111, 113, 119, 135, 139, 143,
+    144, 179, 199, 389, 427, 443, 444, 445, 465, 513, 514, 515, 543, 544, 548, 554, 587, 631, 646,
+    873, 990, 993, 995, 1025, 1026, 1027, 1028, 1029, 1110, 1433, 1720, 1723, 1755, 1900, 2000,
+    2001, 2049, 2121, 2717, 3000, 3128, 3306, 3389, 3986, 4899, 5000, 5009, 5051, 5060, 5101, 5190,
+    5357, 5432, 5631, 5666, 5800, 5900, 6000, 6001, 6646, 7070, 8000, 8008, 8009, 8080, 8081, 8443,
+    8888, 9100, 9999, 10000, 32768, 49152, 49153, 49154, 49155, 49156, 49157,
+];
+
+/// Parse a port specification: `22,80,443,8000-8100`.
+///
+/// Deduped and sorted so a list that names a port twice costs one connection,
+/// and capped at [`MAX_SCAN_PORTS`] with an error rather than a silent trim —
+/// a scan that quietly covered less than it was asked to would be a lie about
+/// what was found.
+pub fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
+    let mut ports: Vec<u16> = Vec::new();
+    for piece in spec.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let port = |s: &str| -> Result<u16, String> {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("{s:?} is not a port number"))
+                .and_then(|p| if p == 0 { Err("port 0 is not a port".into()) } else { Ok(p) })
+        };
+        match piece.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi) = (port(lo)?, port(hi)?);
+                if lo > hi {
+                    return Err(format!("range {lo}-{hi} runs backwards"));
+                }
+                // Bounded before the extend, so a `1-65535` cannot allocate the
+                // whole range on its way to being rejected.
+                if (hi - lo) as usize + 1 + ports.len() > MAX_SCAN_PORTS {
+                    return Err(format!("more than {MAX_SCAN_PORTS} ports"));
+                }
+                ports.extend(lo..=hi);
+            }
+            None => ports.push(port(piece)?),
+        }
+    }
+
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() {
+        return Err("no ports given".to_string());
+    }
+    if ports.len() > MAX_SCAN_PORTS {
+        return Err(format!(
+            "{} ports: at most {MAX_SCAN_PORTS} per scan",
+            ports.len()
+        ));
+    }
+    Ok(ports)
+}
+
+/// Resolve a target to one address using the probe's own resolver rather than
+/// the OS stub, so every action agrees about what the target points at.
+fn resolve_one(req: &Request) -> Result<IpAddr, String> {
+    let target = req.target.trim();
+    if target.is_empty() {
+        return Err("no target: pick a host or type a name".to_string());
+    }
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+    let data = lookup_first(req, target, 1)
+        .ok_or_else(|| format!("{target} does not resolve to an address"))?;
+    data.parse::<IpAddr>()
+        .map_err(|_| format!("{target} resolved to {data:?}, which is not an address"))
+}
+
+fn scan(req: &Request, publish: Publish) -> Result<ScanOutcome, String> {
+    if req.ports.is_empty() {
+        return Err("no ports to scan".to_string());
+    }
+    if req.ports.len() > MAX_SCAN_PORTS {
+        return Err(format!("at most {MAX_SCAN_PORTS} ports per scan"));
+    }
+    let target = resolve_one(req)?;
+    let started = Instant::now();
+    let total = req.ports.len();
+
+    // A shared cursor rather than a per-worker slice: ports differ wildly in how
+    // long they take (a refusal is instant, a filtered port costs the whole
+    // timeout), so a static split would leave workers idle behind one slow shard.
+    let cursor = Mutex::new(0usize);
+    let progress = Mutex::new(ScanOutcome {
+        target,
+        done: 0,
+        total,
+        elapsed: Duration::ZERO,
+        open: Vec::new(),
+        closed: 0,
+        filtered: 0,
+    });
+
+    std::thread::scope(|s| {
+        for _ in 0..SCAN_CONCURRENCY.min(total) {
+            s.spawn(|| loop {
+                let Some(port) = ({
+                    let mut n = cursor.lock().unwrap_or_else(|e| e.into_inner());
+                    let i = *n;
+                    *n += 1;
+                    req.ports.get(i).copied()
+                }) else {
+                    break;
+                };
+
+                let (state, found) = probe_port(target, port);
+                let snapshot = {
+                    let mut st = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    match state {
+                        PortState::Open => st.open.extend(found),
+                        PortState::Closed => st.closed += 1,
+                        PortState::Filtered => st.filtered += 1,
+                    }
+                    st.done += 1;
+                    st.elapsed = started.elapsed();
+                    st.clone()
+                };
+                publish(Outcome::Scan(snapshot));
+            });
+        }
+    });
+
+    let mut out = progress.into_inner().unwrap_or_else(|e| e.into_inner());
+    out.elapsed = started.elapsed();
+    // Workers finish out of order, so the table is sorted once at the end
+    // rather than kept ordered on every insert.
+    out.open.sort_by_key(|p| p.port);
+    Ok(out)
+}
+
+/// One port: how it answered, and its details when it is open.
+fn probe_port(target: IpAddr, port: u16) -> (PortState, Option<PortResult>) {
+    let addr = SocketAddr::new(target, port);
+    let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => return (connect_state(&e), None),
+    };
+
+    // Close with RST rather than FIN. `wg.rs` frees a NAT binding the moment it
+    // sees a reset but otherwise holds it for TCP_IDLE, so without this every
+    // open port would cost a binding for ten minutes — and the host would
+    // accumulate TIME_WAIT for each one besides.
+    socket2::SockRef::from(&stream)
+        .set_linger(Some(Duration::ZERO))
+        .ok();
+
+    // Listen, never speak. A service that announces itself is recorded; one
+    // that waits is left alone rather than prodded with a synthetic request.
+    let mut buf = [0u8; BANNER_BYTES];
+    stream.set_read_timeout(Some(BANNER_TIMEOUT)).ok();
+    let banner = match stream.read(&mut buf) {
+        Ok(n) if n > 0 => banner_text(&buf[..n]),
+        _ => None,
+    };
+
+    (
+        PortState::Open,
+        Some(PortResult { port, service: crate::inspect::service_name(port), banner }),
+    )
+}
+
+/// A service's greeting, made safe to display.
+///
+/// The bytes are whatever the far end sent, so they go through the same escaping
+/// as record text: a banner is one of the few places in this window where a
+/// remote host chooses the characters. Whitespace-only is `None` — a service
+/// that sent a bare newline has not introduced itself.
+fn banner_text(bytes: &[u8]) -> Option<String> {
+    // Trim the BYTES, then escape. The other order turns a trailing CRLF into
+    // the literal text `\x0d\x0a`, which is no longer whitespace and so never
+    // trims — every banner would end in six characters of framing.
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace())?;
+    let mut text = String::new();
+    push_escaped(&mut text, &bytes[start..=end]);
+    Some(clamp_to(&text, BANNER_CHARS))
+}
+
+/// Classify a connect failure. Kept next to [`probe_port`] because the mapping
+/// is the whole difference between "this host declined" and "nothing came back".
+fn connect_state(e: &std::io::Error) -> PortState {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => PortState::Closed,
+        _ => PortState::Filtered,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intel
+// ---------------------------------------------------------------------------
+
+/// Ask one question and return the first answer of the type asked for.
+///
+/// Every failure collapses to `None`: for a dossier assembled from several
+/// independent lookups, a missing field is a missing field, not an error that
+/// throws away the fields that did arrive.
+fn lookup_first(req: &Request, name: &str, qtype: u16) -> Option<String> {
+    let query = build_query(next_id(), name, qtype).ok()?;
+    let bytes = query_udp(req.server, &query, req.timeout).ok()?;
+    let parsed = parse_response(&bytes, &query).ok()?;
+    let want = type_name(qtype);
+    parsed.answers.into_iter().find(|a| a.kind == want).map(|a| a.data)
+}
+
+/// Split a Team Cymru TXT record into its pipe-separated fields.
+///
+/// The record arrives already rendered by `render_txt`, so it is quoted and
+/// escaped; the quotes come off here. Positional and short records are normal —
+/// the caller reads fields by index and tolerates absence.
+fn cymru_fields(data: &str) -> Vec<String> {
+    data.replace('"', "")
+        .split('|')
+        .map(|f| f.trim().to_string())
+        .collect()
+}
+
+fn intel(req: &Request) -> Result<IntelOutcome, String> {
+    let target = resolve_one(req)?;
+    let started = Instant::now();
+    let mut out = IntelOutcome { target: target.to_string(), ..Default::default() };
+
+    out.ptr = lookup_first(req, &reverse_name(target), 12);
+
+    // Team Cymru's IP-to-ASN service is plain DNS, which is the whole reason
+    // this action needs no dependency and no connection to the host itself.
+    let zone = match target {
+        IpAddr::V4(_) => "origin.asn.cymru.com",
+        IpAddr::V6(_) => "origin6.asn.cymru.com",
+    };
+    let origin = lookup_first(req, &format!("{}.{}", reverse_labels(target), zone), 16);
+
+    if let Some(fields) = origin.as_deref().map(cymru_fields) {
+        // "23028 | 216.90.108.0/24 | US | arin | 1998-09-25"
+        out.asn = fields.first().and_then(|s| s.parse::<u32>().ok());
+        out.prefix = non_empty(fields.get(1));
+        out.country = non_empty(fields.get(2));
+        out.registry = non_empty(fields.get(3));
+        out.allocated = non_empty(fields.get(4));
+    }
+
+    if let Some(asn) = out.asn {
+        // "23028 | US | arin | 2002-01-04 | TEAM-CYMRU, US"
+        let name = lookup_first(req, &format!("AS{asn}.asn.cymru.com"), 16);
+        out.org = name.as_deref().map(cymru_fields).and_then(|f| non_empty(f.get(4)));
+    }
+
+    out.elapsed = started.elapsed();
+    if out.ptr.is_none() && out.asn.is_none() {
+        out.note = Some(format!(
+            "no reverse name and no ASN from {} — the resolver may not be reaching \
+             cymru.com, or the address is not routed",
+            req.server
+        ));
+    }
+    Ok(out)
+}
+
+fn non_empty(f: Option<&String>) -> Option<String> {
+    f.filter(|s| !s.is_empty()).cloned()
 }
 
 /// Query ID.
@@ -641,9 +1095,53 @@ fn render_rdata(msg: &[u8], off: usize, rdata: &[u8], kind: u16) -> String {
         },
         6 => render_soa(msg, off).unwrap_or_else(|| malformed(rdata)),
         16 => render_txt(rdata),
+        52 => render_tlsa(rdata),
+        257 => render_caa(rdata),
         _ => malformed(rdata),
     };
     clamp_text(&text)
+}
+
+/// CAA (RFC 8659): a flags byte, a length-prefixed tag, and the rest is value.
+/// Rendered in zone-file order — `0 issue "letsencrypt.org"`.
+fn render_caa(rdata: &[u8]) -> String {
+    let (Some(&flags), Some(&taglen)) = (rdata.first(), rdata.get(1)) else {
+        return malformed(rdata);
+    };
+    // RFC 8659 §4.1 puts the tag at 1..=15 bytes. A zero-length tag is not a
+    // CAA record with an empty tag, it is something else wearing the type.
+    if taglen == 0 || taglen > 15 {
+        return malformed(rdata);
+    }
+    let Some(tag) = rdata.get(2..2 + taglen as usize) else {
+        return malformed(rdata);
+    };
+    let mut out = format!("{flags} ");
+    push_escaped(&mut out, tag);
+    out.push_str(" \"");
+    push_escaped(&mut out, &rdata[2 + taglen as usize..]);
+    out.push('"');
+    out
+}
+
+/// TLSA (RFC 6698): usage, selector, matching type, then the association data,
+/// which is a hash and only meaningful as hex.
+fn render_tlsa(rdata: &[u8]) -> String {
+    let Some(head) = rdata.get(..3) else {
+        return malformed(rdata);
+    };
+    let assoc = &rdata[3..];
+    if assoc.is_empty() {
+        return malformed(rdata);
+    }
+    let mut hex = String::with_capacity(64);
+    for b in assoc.iter().take(32) {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    if assoc.len() > 32 {
+        hex.push('…');
+    }
+    format!("{} {} {} {hex}", head[0], head[1], head[2])
 }
 
 fn render_soa(msg: &[u8], off: usize) -> Option<String> {
@@ -716,10 +1214,14 @@ fn push_escaped(out: &mut String, bytes: &[u8]) {
 }
 
 fn clamp_text(s: &str) -> String {
-    if s.chars().count() <= MAX_RDATA_CHARS {
+    clamp_to(s, MAX_RDATA_CHARS)
+}
+
+fn clamp_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        let mut t: String = s.chars().take(MAX_RDATA_CHARS - 1).collect();
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
     }
@@ -979,12 +1481,227 @@ mod tests {
             record,
             server: "127.0.0.1:53".parse().unwrap(),
             timeout: Duration::from_millis(1),
+            ports: Vec::new(),
         };
         let err = nslookup(&req("1.1.1.1", RecordType::Mx)).unwrap_err();
         assert!(err.contains("only PTR"), "{err}");
         assert!(nslookup(&req("   ", RecordType::Auto))
             .unwrap_err()
             .contains("no target"));
+    }
+
+    #[test]
+    fn a_port_list_is_normalised_before_anything_opens_a_socket() {
+        assert_eq!(parse_ports("22").unwrap(), [22]);
+        assert_eq!(parse_ports(" 80 , 22,443 ").unwrap(), [22, 80, 443]);
+        assert_eq!(parse_ports("20-23").unwrap(), [20, 21, 22, 23]);
+        // Sorted and deduped: a list that names a port twice costs one connect.
+        assert_eq!(parse_ports("443,22,443,20-22").unwrap(), [20, 21, 22, 443]);
+        // Trailing and doubled separators are typing, not an error.
+        assert_eq!(parse_ports("22,,80,").unwrap(), [22, 80]);
+
+        for bad in ["", "  ", ",", "0", "22-", "-22", "80-22", "99999", "http", "22-abc"] {
+            assert!(parse_ports(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_scan_cannot_outgrow_the_nat_table() {
+        // This cap is a NAT budget, not a preference. A filtered port leaves a
+        // binding behind for wg.rs's TCP_IDLE (600s), so a scan's worst case is
+        // its whole list held against MAX_BINDINGS (16384) for ten minutes.
+        // At 1024 that is 6%; the default list is 0.6%.
+        assert!(TOP_PORTS.len() < MAX_SCAN_PORTS);
+        assert_eq!(parse_ports(&format!("1-{MAX_SCAN_PORTS}")).unwrap().len(), MAX_SCAN_PORTS);
+        let over = parse_ports(&format!("1-{}", MAX_SCAN_PORTS + 1)).unwrap_err();
+        assert!(over.contains(&MAX_SCAN_PORTS.to_string()), "{over}");
+
+        // Rejected without ever building the list, so a full-range request
+        // cannot allocate 65535 entries on its way to being refused.
+        assert!(parse_ports("1-65535").is_err());
+        // ...including when the overflow is spread across several pieces.
+        let spread = format!("1-{},{}-{}", MAX_SCAN_PORTS, MAX_SCAN_PORTS + 1, MAX_SCAN_PORTS + 8);
+        assert!(parse_ports(&spread).is_err());
+
+        // The shipped list is itself well-formed: sorted, deduped, no port 0.
+        let mut sorted = TOP_PORTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), TOP_PORTS.len(), "TOP_PORTS repeats a port");
+        assert!(!TOP_PORTS.contains(&0));
+    }
+
+    #[test]
+    fn a_scan_accounts_for_every_port_it_was_given() {
+        // Sixteen workers pull from one cursor and fold results into one
+        // accumulator, so the invariant that matters is arithmetic: every port
+        // lands in exactly one bucket. A lost or double-counted result would
+        // otherwise show up only as a scan whose totals quietly disagree.
+        //
+        // Loopback rather than a mock: `probe_port` is a socket, and the thing
+        // worth testing is what it does with one.
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open_port = open.local_addr().unwrap().port();
+        let closed_port = {
+            let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = s.local_addr().unwrap().port();
+            drop(s); // nothing is listening here now
+            p
+        };
+
+        let req = Request {
+            action: Action::PortScan,
+            target: "127.0.0.1".to_string(),
+            record: RecordType::Auto,
+            server: "127.0.0.1:53".parse().unwrap(),
+            timeout: Duration::from_millis(200),
+            ports: vec![open_port, closed_port],
+        };
+
+        let seen = Mutex::new(Vec::new());
+        let out = match run_with(&req, &|o| {
+            if let Outcome::Scan(s) = o {
+                seen.lock().unwrap().push(s.done);
+            }
+        }) {
+            Ok(Outcome::Scan(s)) => s,
+            other => panic!("expected a scan outcome, got {other:?}"),
+        };
+
+        assert_eq!(out.total, 2);
+        assert_eq!(out.done, 2);
+        assert_eq!(
+            out.open.len() + out.closed + out.filtered,
+            out.total,
+            "a port went missing: {out:?}"
+        );
+        assert!(out.complete());
+        assert_eq!(out.open.len(), 1, "the bound listener should be open: {out:?}");
+        assert_eq!(out.open[0].port, open_port);
+
+        // Progress was published as it went, not only at the end — that is what
+        // keeps a long sweep from being a blank widget.
+        let progress = seen.into_inner().unwrap();
+        assert_eq!(progress.len(), 2, "expected one publish per port");
+        assert!(progress.contains(&2));
+    }
+
+    #[test]
+    fn a_scan_refuses_a_list_it_should_never_have_been_handed() {
+        // `parse_ports` is the gate, but `scan` is what opens sockets, so it
+        // re-checks rather than trusting its caller with the NAT budget.
+        let req = |ports: Vec<u16>| Request {
+            action: Action::PortScan,
+            target: "127.0.0.1".to_string(),
+            record: RecordType::Auto,
+            server: "127.0.0.1:53".parse().unwrap(),
+            timeout: Duration::from_millis(1),
+            ports,
+        };
+        assert!(scan(&req(Vec::new()), &|_| {}).is_err());
+        assert!(scan(&req(vec![80; MAX_SCAN_PORTS + 1]), &|_| {})
+            .unwrap_err()
+            .contains(&MAX_SCAN_PORTS.to_string()));
+    }
+
+    #[test]
+    fn a_connect_failure_says_which_kind_it_was() {
+        use std::io::{Error, ErrorKind};
+        // Refused is a host that answered and declined; everything else is
+        // silence, which is a firewall or a path that never arrived.
+        assert_eq!(
+            connect_state(&Error::from(ErrorKind::ConnectionRefused)),
+            PortState::Closed
+        );
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock, ErrorKind::PermissionDenied] {
+            assert_eq!(connect_state(&Error::from(kind)), PortState::Filtered);
+        }
+    }
+
+    #[test]
+    fn a_banner_is_escaped_and_bounded_before_it_is_shown() {
+        // The far end chooses these bytes, and they land in a label.
+        assert_eq!(banner_text(b"SSH-2.0-OpenSSH_9.6\r\n").unwrap(), "SSH-2.0-OpenSSH_9.6");
+        let hostile = banner_text(b"220 \x1b[2Jmail\0ready").unwrap();
+        assert!(!hostile.contains('\x1b') && !hostile.contains('\0'), "{hostile}");
+        assert!(hostile.contains("\\x1b"));
+
+        // Whitespace only is not an introduction.
+        assert_eq!(banner_text(b""), None);
+        assert_eq!(banner_text(b"\r\n  \t"), None);
+
+        // A chatty service cannot push the other columns off the row.
+        let long = banner_text(&[b'x'; BANNER_BYTES]).unwrap();
+        assert_eq!(long.chars().count(), BANNER_CHARS);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn cymru_records_survive_being_malformed() {
+        // The well-formed shape, which is all that matters on a good day.
+        let origin = cymru_fields("\"23028 | 216.90.108.0/24 | US | arin | 1998-09-25\"");
+        assert_eq!(origin[0], "23028");
+        assert_eq!(origin[1], "216.90.108.0/24");
+        assert_eq!(origin[4], "1998-09-25");
+
+        // Short, empty and absent fields are normal, not errors: the caller
+        // reads by index and a partial dossier beats no dossier.
+        assert_eq!(non_empty(cymru_fields("\"23028 |  | US\"").get(1)), None);
+        assert_eq!(non_empty(cymru_fields("\"23028\"").get(4)), None);
+        assert!(cymru_fields("").len() <= 1);
+
+        // A record that is not a Cymru record at all yields nothing usable
+        // rather than a wrong answer.
+        assert_eq!(cymru_fields("\"v=spf1 -all\"")[0].parse::<u32>().ok(), None);
+        // Pipes with nothing between them do not panic or misalign.
+        assert_eq!(cymru_fields("\"|||||\"").len(), 6);
+    }
+
+    #[test]
+    fn an_address_reverses_the_same_way_for_every_zone_that_wants_it() {
+        // One reversal feeds both in-addr.arpa and Cymru's origin zone; writing
+        // the nibble expansion twice is how the two would drift.
+        let v4: IpAddr = "216.90.108.31".parse().unwrap();
+        assert_eq!(reverse_labels(v4), "31.108.90.216");
+        assert_eq!(reverse_name(v4), "31.108.90.216.in-addr.arpa");
+
+        let v6: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(reverse_name(v6).ends_with(".ip6.arpa"));
+        assert_eq!(reverse_labels(v6).matches('.').count(), 31, "32 nibbles, 31 separators");
+        assert!(!reverse_labels(v6).ends_with('.'), "the zone supplies its own separator");
+
+        // Both forms have to survive encoding, or the query is never sent.
+        for ip in [v4, v6] {
+            assert!(build_query(1, &reverse_name(ip), 12).is_ok());
+            assert!(build_query(1, &format!("{}.origin.asn.cymru.com", reverse_labels(ip)), 16).is_ok());
+        }
+    }
+
+    #[test]
+    fn caa_and_tlsa_render_their_fields() {
+        let q = build_query(1, "example.com", 257).unwrap();
+        let mut caa = vec![0u8, 5];
+        caa.extend_from_slice(b"issue");
+        caa.extend_from_slice(b"letsencrypt.org");
+        let r = response(1, "example.com", 257, &[(257, caa)]);
+        assert_eq!(
+            parse_response(&r, &q).unwrap().answers[0].data,
+            "0 issue \"letsencrypt.org\""
+        );
+
+        // RFC 8659 puts the tag at 1..=15 bytes, so a zero-length tag is
+        // something else wearing the type — shown as bytes, not as a CAA record.
+        assert!(render_caa(&[0, 0, b'x']).starts_with("0x"));
+        assert!(render_caa(&[0, 99, b'x']).starts_with("0x"));
+        assert!(render_caa(&[]).starts_with('<') || render_caa(&[]).starts_with("0x"));
+        for n in 0..8 {
+            let _ = render_caa(&[0u8, 5, b'i', b's', b's', b'u', b'e'][..n.min(7)]);
+        }
+
+        let tlsa = render_tlsa(&[3, 1, 1, 0xab, 0xcd]);
+        assert_eq!(tlsa, "3 1 1 abcd");
+        assert!(render_tlsa(&[3, 1, 1]).starts_with("0x") || render_tlsa(&[3, 1, 1]) == "<empty>");
+        assert!(render_tlsa(&[3, 1]).starts_with("0x"));
     }
 
     #[test]
