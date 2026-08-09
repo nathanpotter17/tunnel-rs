@@ -1,28 +1,4 @@
 //! Live dashboard for the egress engine.
-//!
-//! The window is a grid of WIDGETS: rows of cells that can each be retyped and
-//! resized. The throughput chart and the flow table are widgets like any other,
-//! so a session spent chasing DNS can be three probes and a host table, and a
-//! session spent chasing throughput can be one big chart.
-//!
-//! The grid REFLOWS rather than shrinks. A row holds as many widgets as the
-//! window can show at a legible width; the rest wrap onto a continuation band of
-//! the same height instead of being squeezed or hidden. Tables reflow the same
-//! way: columns are dropped in priority order rather than clipped. Row heights
-//! stretch to fill a tall window and scroll in a short one, so a resize the
-//! operator made is a ratio, not a pixel count that goes wrong at the next
-//! window size.
-//!
-//! Every cell reads the same per-tick [`TrafficSnapshot`] published by the
-//! monitor, so nothing here computes over live engine state and no frame can
-//! block the packet path. The one exception is the PROBE widget, which
-//! originates traffic — and it does that on its own thread (see `probe.rs`),
-//! never on the render loop.
-//!
-//! There is no log pane. The engine's transcript goes to the console and, with
-//! `--log`, to a text file beside the session flow CSV — a scrolling firehose is
-//! not an inspection tool, and mirroring it into the UI put a mutex the logger
-//! writes under on the render path.
 
 use eframe::egui::{self, Align, Color32, Layout, Rounding, Stroke, Vec2};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

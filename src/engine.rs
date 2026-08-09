@@ -1,25 +1,3 @@
-//! The engine: bring up the TUN, capture the default route, arm the safety
-//! guards, then run whichever data path the configured exit needs.
-//!
-//! Two exits, two mechanisms, chosen once at startup:
-//!
-//!   * **Direct** — transparent proxy. Captured flows terminate in a userspace
-//!     smoltcp stack and are re-originated on pinned OS sockets. Re-originating
-//!     raw IP would be cheaper, but Windows has refused raw TCP sends since XP
-//!     SP2, so OS sockets are the only portable egress. See `conn.rs`.
-//!
-//!   * **WireGuard** — router. We own both ends of the path, so nothing needs
-//!     terminating: packets are NAT'd to the WireGuard client address, encrypted,
-//!     and sent. The app's TCP runs end to end. See `wg.rs`.
-//!
-//! The proxy path is fully event-driven in BOTH directions: it wakes on a TUN
-//! packet (upstream), on the connection manager's readiness queue (a flow's
-//! egress socket delivered bytes, or smoltcp fired a socket waker), on smoltcp's
-//! own poll_delay (retransmit / delayed-ACK timers), on the next flow deadline,
-//! or on shutdown. Downstream data is serviced the moment it arrives — never
-//! parked on a timer. TUN egress is drained with an awaited send: lossless,
-//! backpressured.
-
 use anyhow::{bail, Context, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

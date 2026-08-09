@@ -1,4 +1,4 @@
-//! Software-defined tunnel: smoltcp egress engine + live observability.
+//! Software-defined tunnel
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;

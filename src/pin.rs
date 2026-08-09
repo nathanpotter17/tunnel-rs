@@ -1,21 +1,4 @@
 //! Interface-pinned egress — the loop-break primitive.
-//!
-//! When the default route points into our TUN, a normal outbound socket to the
-//! internet would re-enter the TUN and loop forever. The pin has TWO parts:
-//!
-//! 1. **Interface pin** — forces which interface the packet *leaves on*,
-//!    regardless of the routing table.
-//!    - Windows: `IP_UNICAST_IF` (IPv4 wants the ifindex in *network* byte order).
-//!    - Unix: `SO_BINDTODEVICE`.
-//! 2. **Source-address pin** — binds the socket to the uplink's own IP. The
-//!    interface pin does NOT override source-address selection: a wildcard-bound
-//!    socket still source-selects via the routing table, which (post-hijack)
-//!    points at the TUN — packets would leave the physical NIC sourced from the
-//!    TUN's 198.18.x.x address and replies would never return.
-//!
-//! Both parts together make the egress 5-tuple deterministic. We pin to whatever
-//! the host's default interface was **before** we hijacked the route — so if
-//! ProtonVPN was the uplink, the exit stays Proton.
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;

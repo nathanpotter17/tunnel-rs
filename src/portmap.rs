@@ -1,33 +1,4 @@
 //! NAT-PMP client (RFC 6886) — leasing the inbound port from the exit gateway.
-//!
-//! A provider that forwards a port does not hand out a permanent one. The
-//! mapping is a LEASE — sixty seconds on Proton — and it exists only for as long
-//! as something keeps renewing it. There is no port in a WireGuard config file
-//! to copy into settings: the config's NAT-PMP flag makes the peer ELIGIBLE to
-//! ask, and this module is what asks.
-//!
-//! # Transport
-//!
-//! An ordinary unmarked `UdpSocket` to the gateway, exactly as [`crate::probe`]
-//! does for DNS. Under full-tunnel capture it takes the host's default route, so
-//! the request travels the tunnel and the engine's own NAT carries it like any
-//! other application's traffic. Nothing here reaches into the data path.
-//!
-//! # Trust
-//!
-//! A response is attacker-shaped input from outside the process, so it is parsed
-//! the way `probe.rs` parses DNS: length checked before any field is read,
-//! version and opcode verified against what was asked, and the socket
-//! `connect`ed so the kernel drops datagrams from anywhere but the gateway.
-//!
-//! # The Proton convention
-//!
-//! Proton's documented invocation is `natpmpc -a 1 0 udp 60` — suggested
-//! external port 1, internal port 0. The internal 0 is not a port; it is how
-//! their gateway is asked to pick, and it answers by mapping the port it chose
-//! to the same number on the inside. That is why the forwarded port is one
-//! number rather than a pair, and why [`crate::wg::Nat`] translates only the
-//! address for it.
 
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};

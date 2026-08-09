@@ -1,26 +1,4 @@
-//! TunnelVision (CVE-2024-3661) mitigation: a packet-filter kill switch on the
-//! uplink.
-//!
-//! Full-tunnel capture (route.rs) redirects the default route into the TUN with
-//! two `/1` routes. That is a *routing-table* control, and a rogue DHCP server
-//! can beat it with an option-121 classless static route that is more specific
-//! than a `/1`: the affected flow then egresses the physical uplink directly,
-//! never entering the TUN, so nothing downstream (smoltcp, WireGuard, the egress
-//! pin) ever sees it. A routing control cannot defend a routing attack.
-//!
-//! So we enforce the invariant one layer down, where option-121 cannot reach:
-//! a packet filter on the uplink that permits ONLY our own egress traffic (plus
-//! DHCP, so the lease survives) and drops everything else.
-//!   - Linux: nftables. Our sockets carry SO_MARK (pin::EGRESS_FWMARK); the
-//!     chain accepts `meta mark <mark>` and drops other `oifname == uplink`.
-//!   - Windows: WFP. An ALE app-id permit for this exe, weighted above an
-//!     interface-scoped block. (Windows has no socket marks, and the classic
-//!     firewall can't permit-over-block without IPsec — WFP is the only correct
-//!     tool.)
-//!
-//! [`KillSwitch`] is an RAII guard: dropping it (Ctrl-C, error, exit) removes
-//! the filter. Install is fail-closed — the caller refuses to run if it can't
-//! arm, rather than run with an unprotected uplink.
+//! TunnelVision (CVE-2024-3661) mitigation
 
 use anyhow::{anyhow, Result};
 

@@ -1,35 +1,4 @@
-//! WireGuard exit — NAT44 + boringtun encapsulation. No inner TCP stack.
-//!
-//! When the exit is WireGuard the engine owns the *entire* path: it reads the
-//! app's IP packets off the TUN and it owns the encrypted socket to the peer.
-//! There is therefore nothing to proxy. This module rewrites each packet's
-//! source to the WireGuard client address (classic NAT44, incremental checksum
-//! fixups), hands it to boringtun, and sends the ciphertext out the pinned
-//! uplink socket. Return packets are decrypted, un-NAT'd, and written to the TUN.
-//!
-//! # Why not a second smoltcp stack
-//!
-//! Terminating TCP again inside the tunnel makes this a *double* split-TCP
-//! proxy, and each inner socket must eagerly own a WAN-sized send+receive buffer
-//! (smoltcp cannot resize after construction). At the engine's admission ceiling
-//! that is gigabytes of committed buffer for the exit leg alone — memory the
-//! connection manager's budget never charged, because it only ever accounted for
-//! its own app-leg sockets. Routing makes per-flow state a NAT binding (~80
-//! bytes), so the exit leg costs O(bindings) bytes rather than O(bindings x WAN
-//! window).
-//!
-//! Routing is also *more* correct, not merely cheaper:
-//!   - The app's TCP runs end to end against the real server, so congestion
-//!     control, SACK, ECN, and RTT estimation belong to the real path instead of
-//!     being spliced across two independent control loops.
-//!   - MSS follows from one number (the TUN MTU) instead of an inner-MTU clamp
-//!     pessimised to 1280 to survive a path it could not observe.
-//!   - There is no window-sizing agreement between two legs to keep in sync.
-//!
-//! The `Direct` exit still proxies, for a hard technical reason rather than a
-//! stylistic one: re-originating raw IP on the uplink needs raw sockets, and
-//! Windows has refused raw TCP sends since XP SP2. Direct therefore has to go
-//! through OS sockets. Here we own both ends, so we do not.
+//! WireGuard exit — NAT44 + boringtun encapsulation.
 
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -49,30 +18,21 @@ use crate::pin::{self, EgressPin};
 use crate::settings::{Method, PortForward, WgSettings};
 use crate::state::{ExitStats, Shared};
 
-/// Scratch for one encapsulated/decapsulated datagram. A WireGuard datagram
-/// never exceeds the outer MTU, but the peer is untrusted input: size for the
-/// largest IP datagram so a malformed length can never overflow.
+/// Scratch for one encapsulated/decapsulated datagram.
 const SCRATCH: usize = 65535;
 
 /// Packets drained from the TUN per wake before yielding to the other select
-/// arms. Keeps one saturating flow from starving handshake/keepalive servicing.
+/// arms.
 const DRAIN_BUDGET: usize = 1024;
 
-/// Per-protocol binding ceiling. Sized above the connection manager's TCP flow
-/// ceiling so admission is decided in one place, never silently by port
-/// exhaustion. At ~80 bytes of key+value per binding this costs ~2.6 MiB at
-/// saturation — the whole point of routing rather than proxying this leg.
+/// Per-protocol binding ceiling.
 const MAX_BINDINGS: usize = 16_384;
 
-/// NAT binding lifetimes. A binding is refreshed on every packet in either
-/// direction, so these bound only genuinely silent conversations. TCP gets the
-/// long timer because an established-but-idle session is normal; a RST drops the
-/// binding immediately regardless.
+/// NAT binding lifetimes.
 const TCP_IDLE: Duration = Duration::from_secs(600);
 const UDP_IDLE: Duration = Duration::from_secs(120);
 const ICMP_IDLE: Duration = Duration::from_secs(60);
-/// Reassembly-window lifetime for the inbound fragment map (RFC 1122 suggests
-/// 60s; fragments older than this are unreassemblable anyway).
+/// Reassembly-window lifetime for the inbound fragment map
 const FRAG_IDLE: Duration = Duration::from_secs(30);
 
 /// Ephemeral range the NAT allocates from. Below 1024 is reserved so a rewritten

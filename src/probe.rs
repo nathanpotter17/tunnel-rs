@@ -1,36 +1,4 @@
 //! Active probes: questions the operator asks *through* the tunnel.
-//!
-//! Everything else in this binary is passive — `inspect.rs` reports on packets
-//! that were going to cross the TUN anyway. A probe is the opposite: it
-//! originates traffic on purpose, out of an ordinary socket, so the OS routes it
-//! down the same default route every other application uses. Under full-tunnel
-//! capture that means the query enters the TUN, is proxied by the engine, and
-//! egresses through the configured exit — so a probe answers "what does this
-//! host actually see, from where the tunnel actually is", not "what does the
-//! host's resolver stub have cached".
-//!
-//! [`Action`] and [`RecordType`] are the two axes: `Action` for a new *kind* of
-//! question, `RecordType` for another shape of a lookup. Three actions today —
-//! `nslookup`, a TCP connect `scan`, and `intel`, which assembles an address's
-//! ownership from DNS alone.
-//!
-//! ## What this deliberately does not do
-//!
-//! No TLS. Reading a host's certificate means completing a handshake with the
-//! thing under examination and parsing its X.509, which is a whole new class of
-//! attacker-controlled input for a question `intel` mostly answers already.
-//! Scans read banners but never *send* application data: a service that
-//! announces itself is recorded, and one that does not is left alone.
-//!
-//! ## Parsing rules
-//!
-//! A DNS response is attacker-influenced input — the answer comes from whatever
-//! is at the far end of the tunnel, which is the thing under examination. So the
-//! parser here is written to the same standard as `inspect.rs`'s packet parser:
-//! every read is bounds-checked and returns an error rather than panicking,
-//! compression pointers are jump-limited so a self-referential name cannot spin,
-//! record text is escaped before it reaches the UI, and the counts that drive
-//! loops are capped independently of what the header claims.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};

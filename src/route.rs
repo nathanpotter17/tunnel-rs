@@ -1,20 +1,4 @@
 //! Full-tunnel routing with safe teardown.
-//!
-//! Installing a full tunnel means redirecting the host's default route into the
-//! TUN interface so every application's traffic is captured, while keeping the
-//! encrypted tunnel itself reachable. Concretely we:
-//!
-//! 1. Record the current default gateway (so we can restore it).
-//! 2. Pin a host route to the tunnel *server's real IP* via that original
-//!    gateway, so the encrypted UDP packets don't loop back into the TUN.
-//! 3. Add two half-default routes (`0.0.0.0/1` and `128.0.0.0/1`) via the TUN.
-//!    Two /1 routes beat the existing `0.0.0.0/0` default on longest-prefix
-//!    match without deleting it — the classic WireGuard trick — so teardown is
-//!    just removing our routes, leaving the original default intact.
-//!
-//! [`FullTunnel`] is an RAII guard: dropping it (on Ctrl-C, error, or normal
-//! exit) tears the routes back down. Requires administrator/root, which the app
-//! already needs to create the TUN device.
 
 use anyhow::{anyhow, Context, Result};
 use std::net::{IpAddr, Ipv4Addr};

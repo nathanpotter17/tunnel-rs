@@ -1,10 +1,4 @@
 //! smoltcp `Device` fed by an inject queue, emitting into an owned outbound queue.
-//!
-//! The engine drains packets from the TUN, peeks them (to open new flows), then
-//! `inject`s them here for smoltcp to consume on the next poll. Packets smoltcp
-//! emits are pushed into `outbound`; the engine drains that queue after each poll
-//! and writes it to the TUN with an *awaited* send — lossless, with real
-//! backpressure. No channels, no per-packet Arc clones, no silent drops.
 
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;

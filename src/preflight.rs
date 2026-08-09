@@ -1,19 +1,4 @@
-//! Environment preflight — refuse to start on a host that cannot support the
-//! engine, BEFORE anything is mutated.
-//!
-//! The engine's Linux path is not portable-by-luck: it needs root, `/dev/net/tun`,
-//! `iproute2`, and a working `nft` with the `inet` family, and — critically — it
-//! needs a resolver it can bind to the TUN. Under full capture the kill switch
-//! drops every unmarked packet out the uplink, which includes DNS to a LAN
-//! resolver. If the resolver is not moved onto the TUN, name resolution stops
-//! dead and the host looks "broken" with no leak and no error.
-//!
-//! Every check below is a hard failure with the exact remediation, run before
-//! the TUN exists, before the route is hijacked, and before the kill switch is
-//! armed — so a failed precondition costs the user nothing but a message.
-//!
-//! Preflight also RESOLVES the resolver strategy once and hands it to
-//! `route::DnsGuard`, so detection and use cannot disagree.
+//! Environment preflight
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;

@@ -1,24 +1,4 @@
 //! Event-driven snooper tripwire — detect, lock down, exit.
-//!
-//! killswitch.rs is the always-on wall that contains leaks in real time; THIS is
-//! the tripwire that (a) tells you a routing attack happened and (b) slams a
-//! reboot-clearable kernel block and terminates. It cannot *prevent* the attack —
-//! detection is inherently a step behind the reroute — so its job is alarm +
-//! lockdown, and the design's "rotate keys" covers the handful of packets that
-//! leak in the gap before the always-on wall applies to the new route.
-//!
-//! Detection watches the one invariant any routing attack must break — "every
-//! public destination egresses the TUN" — checking the EFFECT (which interface
-//! the OS would use) not the MECHANISM, so it catches DHCP option-121, an IPv6 RA
-//! analog, or a rogue static route alike. It is event-driven: a NETLINK_ROUTE
-//! socket (Linux) / NotifyRouteChange2 (Windows) fires the instant the table
-//! mutates; the canary invariant PLUS a discriminator (our own /1 routes still
-//! intact) is the verdict, so benign route churn never trips it.
-//!
-//! The lockdown is a kernel firewall block that SURVIVES our process exit — no
-//! process has to stay alive to enforce it — and CLEARS ON REBOOT (the "must
-//! restart" the design already mandates). No adapter disable, no child process on
-//! the kill path, nothing to race.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

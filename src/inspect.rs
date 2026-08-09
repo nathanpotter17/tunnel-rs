@@ -1,14 +1,4 @@
 //! Traffic inspection for observability.
-//!
-//! Parses the plaintext IP packets that cross the tunnel (captured at the TUN
-//! boundary, before encryption on the way out and after decryption on the way
-//! in), extracts the flow 5-tuple, and classifies each packet by application
-//! protocol using lightweight heuristics. A [`TrafficMonitor`] aggregates the
-//! results into rolling throughput series, counters, and a per-flow table that
-//! the GUI renders live.
-//!
-//! Nothing here decrypts or stores payloads — it only reads packet headers and
-//! (for a few protocols) the first handshake bytes to fingerprint the protocol.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
