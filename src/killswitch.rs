@@ -23,9 +23,11 @@ impl KillSwitch {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     use tracing::warn;
+
+    // Through `preflight`, which is where the binary is located: a bare
+    // `Command::new("nft")` here failed to arm on the hosts preflight supports.
+    use crate::preflight::nft_apply;
 
     const TABLE: &str = "tunnel_killswitch";
 
@@ -71,29 +73,6 @@ mod platform {
         );
         nft_apply(&ruleset)?;
         Ok(Guard { installed: true })
-    }
-
-    fn nft_apply(script: &str) -> Result<()> {
-        let mut child = Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn nft (is the nftables package installed?): {e}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("nft stdin unavailable"))?
-            .write_all(script.as_bytes())
-            .map_err(|e| anyhow!("writing nft ruleset: {e}"))?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| anyhow!("waiting on nft: {e}"))?;
-        if !out.status.success() {
-            return Err(anyhow!("nft failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        Ok(())
     }
 
     impl Drop for Guard {

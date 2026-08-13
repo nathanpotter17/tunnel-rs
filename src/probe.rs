@@ -1185,7 +1185,10 @@ fn clamp_text(s: &str) -> String {
     clamp_to(s, MAX_RDATA_CHARS)
 }
 
-fn clamp_to(s: &str, max: usize) -> String {
+/// Shorten to `max` characters, marking the cut with an ellipsis. Counts chars,
+/// not bytes: record text and banners are attacker-authored, and slicing one
+/// mid-codepoint panics. Shared with `gui.rs`, which needs exactly this.
+pub(crate) fn clamp_to(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

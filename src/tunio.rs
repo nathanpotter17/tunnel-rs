@@ -113,7 +113,12 @@ mod platform {
         }
     }
 
-    fn locate_wintun_dll() -> Option<PathBuf> {
+    /// Where the arch-matched `wintun.dll` is, if it is anywhere we look.
+    ///
+    /// Public because `preflight` asks the same question first, and must ask it
+    /// of the same list: two search paths means a preflight that passes and a
+    /// loader that then fails, which is the failure preflight exists to prevent.
+    pub fn locate_wintun_dll() -> Option<PathBuf> {
         let arch = if cfg!(target_arch = "x86_64") {
             "amd64"
         } else if cfg!(target_arch = "aarch64") {
@@ -390,3 +395,6 @@ mod platform {
 }
 
 pub use platform::KeepAlive;
+
+#[cfg(windows)]
+pub use platform::locate_wintun_dll;

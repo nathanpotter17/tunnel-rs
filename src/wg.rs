@@ -324,7 +324,7 @@ impl Nat {
         // to the same source address, so they need only the address fixup — and
         // no L4 checksum patch, because the checksum lives in the first fragment.
         if h.frag_offset != 0 {
-            rewrite_src_addr(pkt, h.ihl, src, new_src, None);
+            rewrite_addr(pkt, h.ihl, Side::Src, src, new_src, None);
             return Verdict::Translate;
         }
 
@@ -351,7 +351,7 @@ impl Nat {
                     // demultiplex. Forward statelessly; the ICMP checksum does
                     // not cover the IPv4 header, so only the header needs repair.
                     _ => {
-                        rewrite_src_addr(pkt, h.ihl, src, new_src, None);
+                        rewrite_addr(pkt, h.ihl, Side::Src, src, new_src, None);
                         return Verdict::Translate;
                     }
                 }
@@ -360,7 +360,7 @@ impl Nat {
             // behind one address without their own keying. Exactly one host sits
             // behind this NAT, so a stateless address rewrite is unambiguous.
             _ => {
-                rewrite_src_addr(pkt, h.ihl, src, new_src, None);
+                rewrite_addr(pkt, h.ihl, Side::Src, src, new_src, None);
                 return Verdict::Translate;
             }
         };
@@ -377,7 +377,7 @@ impl Nat {
         // mapping is static and nothing here can expire it.
         if let Some(f) = self.forward {
             if matches!(h.proto, PROTO_TCP | PROTO_UDP) && src == f.host && sport == f.port {
-                rewrite_src_addr(pkt, h.ihl, src, new_src, Some(h.proto));
+                rewrite_addr(pkt, h.ihl, Side::Src, src, new_src, Some(h.proto));
                 return Verdict::Translate;
             }
         }
@@ -402,8 +402,8 @@ impl Nat {
             b.last = now;
         }
 
-        rewrite_src_addr(pkt, h.ihl, src, new_src, Some(h.proto));
-        rewrite_src_port(pkt, h.ihl, h.proto, sport, port);
+        rewrite_addr(pkt, h.ihl, Side::Src, src, new_src, Some(h.proto));
+        rewrite_port(pkt, h.ihl, Side::Src, h.proto, sport, port);
 
         // A RST ends the conversation now rather than holding the binding for the
         // idle timer; nothing else will arrive on it.
@@ -429,7 +429,7 @@ impl Nat {
             let Some((orig, _)) = self.frag.get(&fk).copied() else {
                 return Verdict::Drop;
             };
-            rewrite_dst_addr(pkt, h.ihl, h.dst, orig, None);
+            rewrite_addr(pkt, h.ihl, Side::Dst, h.dst, orig, None);
             return Verdict::Translate;
         }
 
@@ -474,7 +474,7 @@ impl Nat {
                     );
                 }
                 // Address only: the port is the same number on both sides.
-                rewrite_dst_addr(pkt, h.ihl, self.wg_addr, f.host, Some(h.proto));
+                rewrite_addr(pkt, h.ihl, Side::Dst, self.wg_addr, f.host, Some(h.proto));
                 self.forwarded_in = self.forwarded_in.saturating_add(1);
                 return Verdict::Translate;
             }
@@ -496,8 +496,8 @@ impl Nat {
             );
         }
 
-        rewrite_dst_addr(pkt, h.ihl, self.wg_addr, b.src, Some(h.proto));
-        rewrite_dst_port(pkt, h.ihl, h.proto, port, b.sport);
+        rewrite_addr(pkt, h.ihl, Side::Dst, self.wg_addr, b.src, Some(h.proto));
+        rewrite_port(pkt, h.ihl, Side::Dst, h.proto, port, b.sport);
 
         if h.proto == PROTO_TCP && tcp_flags(pkt, h.ihl).is_some_and(|f| f & 0x04 != 0) {
             self.close(h.proto, port);
@@ -555,10 +555,10 @@ impl Nat {
         // errors are rare and small, so an O(n) recompute here is not a hot path.
         {
             let quote = &mut pkt[q..];
-            rewrite_src_addr(quote, inner.ihl, self.wg_addr, host, Some(inner.proto));
-            rewrite_src_port(quote, inner.ihl, inner.proto, port, hport);
+            rewrite_addr(quote, inner.ihl, Side::Src, self.wg_addr, host, Some(inner.proto));
+            rewrite_port(quote, inner.ihl, Side::Src, inner.proto, port, hport);
         }
-        rewrite_dst_addr(pkt, ihl, self.wg_addr, host, None);
+        rewrite_addr(pkt, ihl, Side::Dst, self.wg_addr, host, None);
         let icmp = &mut pkt[ihl..];
         icmp[2] = 0;
         icmp[3] = 0;
@@ -712,29 +712,72 @@ fn store_l4_csum(pkt: &mut [u8], at: usize, proto: u8, value: u16) {
     pkt[at..at + 2].copy_from_slice(&v.to_be_bytes());
 }
 
-/// `l4` carries the protocol whose pseudo-header checksum must also be patched,
-/// or `None` where there is none to patch (later fragments, ICMP, unknown L4).
-fn rewrite_src_addr(pkt: &mut [u8], ihl: usize, old: Ipv4Addr, new: Ipv4Addr, l4: Option<u8>) {
-    let (o, n) = (old.octets(), new.octets());
-    if o == n {
-        return;
+/// Which endpoint of a packet a rewrite touches.
+///
+/// A name, not a byte offset: 12/16 and 0/2 are transposable, and the checksum
+/// repair would faithfully follow a transposition into a packet that is
+/// well-formed, verifiable and addressed to the wrong place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Src,
+    Dst,
+}
+
+impl Side {
+    /// Offset of this side's address within the IPv4 header.
+    const fn addr(self) -> usize {
+        match self {
+            Side::Src => 12,
+            Side::Dst => 16,
+        }
     }
-    pkt[12..16].copy_from_slice(&n);
-    patch_hdr_csum(pkt, o, n);
-    if let Some(proto) = l4 {
-        patch_l4_for_addr(pkt, ihl, proto, o, n);
+
+    /// Offset of this side's port within the L4 header.
+    const fn port(self) -> usize {
+        match self {
+            Side::Src => 0,
+            Side::Dst => 2,
+        }
     }
 }
 
-fn rewrite_dst_addr(pkt: &mut [u8], ihl: usize, old: Ipv4Addr, new: Ipv4Addr, l4: Option<u8>) {
+/// Rewrite one address in place and repair every checksum that covers it. `l4`
+/// carries the protocol whose pseudo-header checksum must also be patched, or
+/// `None` where there is none (later fragments, ICMP, unknown L4).
+fn rewrite_addr(pkt: &mut [u8], ihl: usize, side: Side, old: Ipv4Addr, new: Ipv4Addr, l4: Option<u8>) {
     let (o, n) = (old.octets(), new.octets());
     if o == n {
         return;
     }
-    pkt[16..20].copy_from_slice(&n);
+    let at = side.addr();
+    pkt[at..at + 4].copy_from_slice(&n);
     patch_hdr_csum(pkt, o, n);
+    // The TCP/UDP checksum covers a pseudo-header holding both addresses, so an
+    // address rewrite invalidates it as surely as a port rewrite does.
     if let Some(proto) = l4 {
-        patch_l4_for_addr(pkt, ihl, proto, o, n);
+        patch_l4(pkt, ihl, proto, |cur| patch32(cur, o, n));
+    }
+}
+
+/// Rewrite one port — or, for ICMP, the echo identifier that stands in for
+/// one — and repair the checksum that covers it.
+fn rewrite_port(pkt: &mut [u8], ihl: usize, side: Side, proto: u8, old: u16, new: u16) {
+    if old == new {
+        return;
+    }
+    match proto {
+        PROTO_TCP | PROTO_UDP => {
+            if pkt.len() < ihl + 4 {
+                return;
+            }
+            let at = ihl + side.port();
+            pkt[at..at + 2].copy_from_slice(&new.to_be_bytes());
+            patch_l4(pkt, ihl, proto, |cur| patch16(cur, old, new));
+        }
+        // One field, not a pair: both directions key on it, so `side` does not
+        // enter into an ICMP rewrite.
+        PROTO_ICMP => patch_icmp_id(pkt, ihl, old, new),
+        _ => {}
     }
 }
 
@@ -744,9 +787,13 @@ fn patch_hdr_csum(pkt: &mut [u8], old: [u8; 4], new: [u8; 4]) {
     pkt[10..12].copy_from_slice(&c.to_be_bytes());
 }
 
-/// The TCP/UDP checksum covers an IPv4 pseudo-header containing both addresses,
-/// so an address rewrite invalidates it as surely as a port rewrite does.
-fn patch_l4_for_addr(pkt: &mut [u8], ihl: usize, proto: u8, old: [u8; 4], new: [u8; 4]) {
+/// Apply an RFC 1624 delta to the L4 checksum, if this protocol has one our edit
+/// invalidated.
+///
+/// The bounds check, protocol lookup and UDP disabled-checksum escape are the
+/// same whether an address or a port moved; only the delta width differs, which
+/// is what `patch` carries. `impl FnOnce`, so it inlines — this is per-packet.
+fn patch_l4(pkt: &mut [u8], ihl: usize, proto: u8, patch: impl FnOnce(u16) -> u16) {
     let Some(off) = l4_csum_offset(proto) else {
         return;
     };
@@ -758,56 +805,7 @@ fn patch_l4_for_addr(pkt: &mut [u8], ihl: usize, proto: u8, old: [u8; 4], new: [
     if proto == PROTO_UDP && cur == 0 {
         return; // checksum disabled by the sender
     }
-    store_l4_csum(pkt, at, proto, patch32(cur, old, new));
-}
-
-fn rewrite_src_port(pkt: &mut [u8], ihl: usize, proto: u8, old: u16, new: u16) {
-    if old == new {
-        return;
-    }
-    match proto {
-        PROTO_TCP | PROTO_UDP => {
-            if pkt.len() < ihl + 4 {
-                return;
-            }
-            pkt[ihl..ihl + 2].copy_from_slice(&new.to_be_bytes());
-            patch_l4_for_port(pkt, ihl, proto, old, new);
-        }
-        PROTO_ICMP => patch_icmp_id(pkt, ihl, old, new),
-        _ => {}
-    }
-}
-
-fn rewrite_dst_port(pkt: &mut [u8], ihl: usize, proto: u8, old: u16, new: u16) {
-    if old == new {
-        return;
-    }
-    match proto {
-        PROTO_TCP | PROTO_UDP => {
-            if pkt.len() < ihl + 4 {
-                return;
-            }
-            pkt[ihl + 2..ihl + 4].copy_from_slice(&new.to_be_bytes());
-            patch_l4_for_port(pkt, ihl, proto, old, new);
-        }
-        PROTO_ICMP => patch_icmp_id(pkt, ihl, old, new),
-        _ => {}
-    }
-}
-
-fn patch_l4_for_port(pkt: &mut [u8], ihl: usize, proto: u8, old: u16, new: u16) {
-    let Some(off) = l4_csum_offset(proto) else {
-        return;
-    };
-    let at = ihl + off;
-    if pkt.len() < at + 2 {
-        return;
-    }
-    let cur = u16::from_be_bytes([pkt[at], pkt[at + 1]]);
-    if proto == PROTO_UDP && cur == 0 {
-        return;
-    }
-    store_l4_csum(pkt, at, proto, patch16(cur, old, new));
+    store_l4_csum(pkt, at, proto, patch(cur));
 }
 
 /// The ICMP checksum covers the identifier but not the IPv4 header, so an echo
@@ -1428,7 +1426,7 @@ mod tests {
         // The whole NAT rests on RFC 1624 being exact: patching a header must
         // give bit-for-bit what recomputing it from scratch would.
         let mut patched = tcp_packet(HOST, SERVER, 40000, 443, 0x18);
-        rewrite_src_addr(&mut patched, 20, HOST, WG, Some(PROTO_TCP));
+        rewrite_addr(&mut patched, 20, Side::Src, HOST, WG, Some(PROTO_TCP));
 
         let fresh = tcp_packet(WG, SERVER, 40000, 443, 0x18);
         assert_eq!(
@@ -1537,3 +1535,4 @@ mod tests {
         assert_eq!(nat.translate_out(&mut p, now), Verdict::Exhausted);
     }
 }
+

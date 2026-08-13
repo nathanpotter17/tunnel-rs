@@ -691,6 +691,18 @@ impl TrafficMonitor {
         }
     }
 
+    /// The one way in — and it fails fast on purpose.
+    ///
+    /// Nothing under this lock can panic, so a poisoned guard means an invariant
+    /// this module does not model has already been violated. The engine's policy
+    /// for that is to stop, not to carry on with observability it can no longer
+    /// vouch for: `record` runs on the packet path, so propagating the panic is
+    /// what takes the data path down with the statistics rather than leaving a
+    /// live tunnel reporting frozen numbers. Recovering here would invert that.
+    fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().expect("traffic monitor poisoned — engine must stop")
+    }
+
     /// Record one plaintext IP packet observed at the TUN boundary.
     pub fn record(&self, dir: Direction, pkt: &[u8]) {
         let parsed = match parse(pkt) {
@@ -709,7 +721,7 @@ impl TrafficMonitor {
             l4: parsed.l4.label(),
         };
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let now = Instant::now();
         match dir {
             Direction::Up => {
@@ -777,7 +789,7 @@ impl TrafficMonitor {
 
     /// Advance the throughput series and per-flow rates. Call ~once per second.
     pub fn tick(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let now = Instant::now();
         let dt = now.duration_since(inner.last_tick).as_secs_f64().max(0.001);
         inner.last_tick = now;
@@ -842,7 +854,7 @@ impl TrafficMonitor {
             local_port,
             l4: if tcp { "TCP" } else { "UDP" },
         };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if let Some(f) = inner.flows.get_mut(&key) {
             f.status = status;
         }
@@ -852,7 +864,7 @@ impl TrafficMonitor {
     /// `path`, ordered by first-seen. Returns the number of rows. Called on
     /// shutdown.
     pub fn write_csv(&self, path: &std::path::Path) -> std::io::Result<usize> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         if inner.archive_dropped > 0 {
             tracing::warn!(
                 "flow archive capped at {} records; {} older flows were dropped and \
@@ -1108,22 +1120,13 @@ pub(crate) fn service_name(port: u16) -> &'static str {
     }
 }
 
+/// `ip:port`, bracketing a v6 literal so its colons are not read as the port.
+/// Port 0 means the protocol has no port space (ICMP, ESP, …).
 fn fmt_endpoint(ip: IpAddr, port: u16) -> String {
-    match ip {
-        IpAddr::V4(_) => {
-            if port == 0 {
-                ip.to_string()
-            } else {
-                format!("{}:{}", ip, port)
-            }
-        }
-        IpAddr::V6(_) => {
-            if port == 0 {
-                ip.to_string()
-            } else {
-                format!("[{}]:{}", ip, port)
-            }
-        }
+    match (ip, port) {
+        (_, 0) => ip.to_string(),
+        (IpAddr::V4(_), _) => format!("{ip}:{port}"),
+        (IpAddr::V6(_), _) => format!("[{ip}]:{port}"),
     }
 }
 

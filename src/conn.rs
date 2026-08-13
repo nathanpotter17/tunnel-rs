@@ -57,6 +57,47 @@ const UDP_FLOW_COST: usize =
 const MAX_TCP_FLOWS: usize = 8192;
 const MAX_UDP_FLOWS: usize = 4096;
 
+/// One protocol's admission budget: the live charge, what a flow costs, and the
+/// two ceilings it is charged against.
+///
+/// TCP and UDP admit, charge and refund by identical arithmetic over different
+/// constants. Writing that twice does not crash — it charges one protocol's
+/// cost and refunds the other's, drifting the counter until admission silently
+/// stops. Binding each cost to the counter it moves makes that unwritable.
+struct Budget {
+    /// Live sum of `cost` over the open flows of this protocol.
+    charged: usize,
+    cost: usize,
+    max_flows: usize,
+    max_bytes: usize,
+}
+
+impl Budget {
+    const fn new(cost: usize, max_flows: usize, max_bytes: usize) -> Self {
+        Self { charged: 0, cost, max_flows, max_bytes }
+    }
+
+    /// Whether one more flow fits. The byte budget binds at the shipped buffer
+    /// sizes; the count is the backstop under smaller ones.
+    fn admits(&self, live: usize) -> bool {
+        live < self.max_flows && self.charged + self.cost <= self.max_bytes
+    }
+
+    fn charge(&mut self) {
+        self.charged += self.cost;
+    }
+
+    /// Saturating: a double refund must not wrap into an unbounded budget.
+    fn refund(&mut self) {
+        self.charged = self.charged.saturating_sub(self.cost);
+    }
+
+    /// For the admission-denied log line.
+    fn mib(&self) -> usize {
+        self.charged / (1024 * 1024)
+    }
+}
+
 /// Half-open flood guard: a flow that never reaches Established within this
 /// window is an abandoned SYN or a flood probe. Reaped from the deadline heap —
 /// this is the primary bound on flood-driven accumulation.
@@ -307,11 +348,11 @@ pub struct ConnManager {
     egress: EgressPin,
     tcp: HashMap<FourTuple, TcpConn>,
     udp: HashMap<FourTuple, UdpConn>,
-    /// Live sum of TCP_FLOW_COST over open TCP flows — the admission gate. Plain
-    /// usize (not atomic): ConnManager is owned and mutated only by the engine's
-    /// single poll task, so there is no sharing to synchronise.
-    tcp_bytes: usize,
-    udp_bytes: usize,
+    /// The admission gates. Plain `usize` inside (not atomic): ConnManager is
+    /// owned and mutated only by the engine's single poll task, so there is no
+    /// sharing to synchronise.
+    tcp_budget: Budget,
+    udp_budget: Budget,
     /// Observability sink. Admission decisions (shed / reap) are reported here so
     /// the dashboard tags those flows as deliberate engine actions rather than
     /// letting them read as anomalous half-open / up-only conversations.
@@ -334,8 +375,8 @@ impl ConnManager {
             egress,
             tcp: HashMap::new(),
             udp: HashMap::new(),
-            tcp_bytes: 0,
-            udp_bytes: 0,
+            tcp_budget: Budget::new(TCP_FLOW_COST, MAX_TCP_FLOWS, TCP_MEM_BUDGET),
+            udp_budget: Budget::new(UDP_FLOW_COST, MAX_UDP_FLOWS, UDP_MEM_BUDGET),
             monitor,
             ready: Ready::new(),
             scratch: Vec::new(),
@@ -367,12 +408,11 @@ impl ConnManager {
         let key = FourTuple { src: flow.src, dst: flow.dst };
         match flow.proto {
             6 if flow.syn && !self.tcp.contains_key(&key) => {
-                if self.tcp.len() >= MAX_TCP_FLOWS || self.tcp_bytes + TCP_FLOW_COST > TCP_MEM_BUDGET
-                {
+                if !self.tcp_budget.admits(self.tcp.len()) {
                     debug!(
                         "tcp admission denied (flows {}, {} MiB used) — shedding SYN -> {}",
                         self.tcp.len(),
-                        self.tcp_bytes / (1024 * 1024),
+                        self.tcp_budget.mib(),
                         key.dst
                     );
                     self.monitor
@@ -382,12 +422,11 @@ impl ConnManager {
                 self.open_tcp(sockets, key);
             }
             17 if !self.udp.contains_key(&key) => {
-                if self.udp.len() >= MAX_UDP_FLOWS || self.udp_bytes + UDP_FLOW_COST > UDP_MEM_BUDGET
-                {
+                if !self.udp_budget.admits(self.udp.len()) {
                     debug!(
                         "udp admission denied (flows {}, {} MiB used) — shedding -> {}",
                         self.udp.len(),
-                        self.udp_bytes / (1024 * 1024),
+                        self.udp_budget.mib(),
                         key.dst
                     );
                     self.monitor
@@ -448,7 +487,7 @@ impl ConnManager {
                 waker,
             },
         );
-        self.tcp_bytes += TCP_FLOW_COST;
+        self.tcp_budget.charge();
         // Bounds SYN -> Established so a half-open flood cannot accumulate.
         self.deadlines.push(Reverse((deadline, id)));
         // Serviced on the next dispatch regardless of whether smoltcp fires a
@@ -508,7 +547,7 @@ impl ConnManager {
                 waker,
             },
         );
-        self.udp_bytes += UDP_FLOW_COST;
+        self.udp_budget.charge();
         self.deadlines.push(Reverse((now + UDP_IDLE, id)));
         self.ready.mark(id);
         self.monitor
@@ -619,7 +658,7 @@ impl ConnManager {
         if close {
             if let Some(conn) = self.tcp.remove(&key) {
                 sockets.remove(conn.handle);
-                self.tcp_bytes = self.tcp_bytes.saturating_sub(TCP_FLOW_COST);
+                self.tcp_budget.refund();
                 debug!("tcp close {}", key.dst);
             }
         }
@@ -698,7 +737,7 @@ impl ConnManager {
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                     self.tcp.remove(&key);
                     sockets.remove(handle);
-                    self.tcp_bytes = self.tcp_bytes.saturating_sub(TCP_FLOW_COST);
+                    self.tcp_budget.refund();
                     debug!("tcp reap {} (handshake timeout)", key.dst);
                     self.monitor
                         .note_flow(true, key.dst, key.src.port(), FlowStatus::Reaped);
@@ -724,7 +763,7 @@ impl ConnManager {
                     let handle = conn.handle;
                     self.udp.remove(&key);
                     sockets.remove(handle);
-                    self.udp_bytes = self.udp_bytes.saturating_sub(UDP_FLOW_COST);
+                    self.udp_budget.refund();
                     debug!("udp expire {}", key.dst);
                 }
             }
@@ -735,6 +774,17 @@ impl ConnManager {
 // ============================================================================
 // Egress tasks
 // ============================================================================
+
+/// Report a dead egress leg to the poll loop.
+///
+/// One action, two halves: the drop is what the next service pass reads as EOF,
+/// the mark is what makes that pass happen now rather than on a timer. A drop
+/// without a mark leaves the flow open until its deadline — which, past the TCP
+/// handshake, is never.
+fn fail_flow(out_tx: mpsc::Sender<Vec<u8>>, ready: &Ready, id: FlowId) {
+    drop(out_tx);
+    ready.mark(id);
+}
 
 async fn tcp_task(
     egress: EgressPin,
@@ -752,8 +802,7 @@ async fn tcp_task(
         }
         Err(e) => {
             warn!("egress tcp {} failed: {}", dst, e);
-            drop(out_tx); // the poll loop closes the smoltcp side on next service
-            ready.mark(id); // ...which we trigger now, not on a timer
+            fail_flow(out_tx, &ready, id);
             return;
         }
     };
@@ -809,20 +858,20 @@ async fn udp_task(
     id: FlowId,
     stats: Arc<ExitStats>,
 ) {
+    // Reported separately: a bind failure is a local socket or pin problem, a
+    // connect failure is a route problem, and they send you to different places.
     let sock: Arc<UdpSocket> = match pin::bind_udp(dst, &egress).await {
         Ok(s) => match s.connect(dst).await {
             Ok(()) => Arc::new(s),
             Err(e) => {
                 warn!("egress udp connect {} failed: {}", dst, e);
-                drop(out_tx);
-                ready.mark(id);
+                fail_flow(out_tx, &ready, id);
                 return;
             }
         },
         Err(e) => {
             warn!("egress udp {} failed: {}", dst, e);
-            drop(out_tx);
-            ready.mark(id);
+            fail_flow(out_tx, &ready, id);
             return;
         }
     };
@@ -917,6 +966,35 @@ mod tests {
         assert!(UDP_FLOW_COST > 0 && UDP_FLOW_COST <= UDP_MEM_BUDGET);
         assert!(TCP_MEM_BUDGET / TCP_FLOW_COST <= MAX_TCP_FLOWS);
         assert!(UDP_MEM_BUDGET / UDP_FLOW_COST <= MAX_UDP_FLOWS);
+    }
+
+    #[test]
+    fn a_budget_binds_on_whichever_ceiling_arrives_first() {
+        // Bytes bind: three flows fit exactly, the fourth does not, and a refund
+        // makes room again.
+        let mut b = Budget::new(100, 1000, 300);
+        for live in 0..3 {
+            assert!(b.admits(live), "flow {live} should fit");
+            b.charge();
+        }
+        assert!(!b.admits(3), "the byte ceiling did not bind");
+        b.refund();
+        assert!(b.admits(2));
+
+        // Count binds: the byte budget is ample, the backstop is not.
+        let mut c = Budget::new(1, 2, usize::MAX);
+        c.charge();
+        assert!(c.admits(1));
+        assert!(!c.admits(2), "the count backstop did not bind");
+
+        // Refunds saturate: an over-refund cannot wrap the counter into an
+        // unbounded budget, which is the one arithmetic error that would be
+        // silent rather than loud.
+        let mut d = Budget::new(64, 8, 128);
+        d.refund();
+        d.refund();
+        assert_eq!(d.charged, 0);
+        assert!(d.admits(0));
     }
 
     fn tuple(port: u16) -> FourTuple {

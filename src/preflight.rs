@@ -26,6 +26,14 @@ pub fn run(capture: bool) -> Result<Preflight> {
     platform::run(capture)
 }
 
+/// Feed a ruleset to `nft -f -`. The only place this process invokes nftables,
+/// so preflight's probes, the kill switch and the tripwire's lockdown cannot
+/// disagree about WHICH `nft` — which is not "whatever PATH says": on Ubuntu it
+/// is in `/usr/sbin`, absent from a desktop `sudo` PATH. Two of the three
+/// callers used the bare name, so preflight passed and the kill switch did not.
+#[cfg(target_os = "linux")]
+pub(crate) use platform::nft_apply;
+
 // ============================================================================
 // Linux
 // ============================================================================
@@ -33,7 +41,9 @@ pub fn run(capture: bool) -> Result<Preflight> {
 mod platform {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
 
     /// Directories searched in addition to `PATH`: `nft` and `ip` live in
     /// `/usr/sbin` on Ubuntu, which is absent from a desktop session's PATH even
@@ -52,11 +62,10 @@ mod platform {
         info!("preflight: iproute2 at {}", ip.display());
 
         if capture {
-            let nft = require_tool("nft", "nftables")?;
-            info!("preflight: nftables at {}", nft.display());
-            require_nft_inet_family(&nft)?;
-            reject_panic_lockdown(&nft)?;
-            clear_stale_killswitch(&nft)?;
+            info!("preflight: nftables at {}", require_nft()?.display());
+            require_nft_inet_family()?;
+            reject_panic_lockdown()?;
+            clear_stale_killswitch()?;
         }
 
         let dns = if capture { detect_dns_backend()? } else { DnsBackend::ResolvConf };
@@ -130,18 +139,36 @@ mod platform {
         })
     }
 
+    /// The `nft` binary, located once. Cached because the tripwire's lockdown
+    /// reaches for it on the way down, where a PATH walk is the last thing
+    /// worth doing.
+    fn nft_binary() -> Option<&'static Path> {
+        static NFT: OnceLock<Option<PathBuf>> = OnceLock::new();
+        NFT.get_or_init(|| find_tool("nft")).as_deref()
+    }
+
+    fn require_nft() -> Result<&'static Path> {
+        nft_binary().ok_or_else(|| {
+            anyhow!(
+                "`nft` not found on PATH or in {dirs:?}.\n\
+                 Fix:  sudo apt-get install -y nftables",
+                dirs = SBIN_DIRS
+            )
+        })
+    }
+
     /// Prove the kernel exposes nf_tables' `inet` family AND that we may write to
     /// it. `nft` being installed proves neither: a container without
     /// CAP_NET_ADMIN, or a kernel without `nf_tables_inet`, fails only at rule
     /// load — which, without this check, happens after the route is hijacked.
-    fn require_nft_inet_family(nft: &std::path::Path) -> Result<()> {
+    fn require_nft_inet_family() -> Result<()> {
         const PROBE: &str = "tunnel_preflight";
         let script = format!(
             "add table inet {PROBE}\n\
              add chain inet {PROBE} out {{ type filter hook output priority 0 ; policy accept ; }}\n\
              delete table inet {PROBE}\n"
         );
-        nft_apply(nft, &script).map_err(|e| {
+        nft_apply(&script).map_err(|e| {
             anyhow!(
                 "nftables cannot load an `inet` filter chain: {e}\n\
                  The kill switch (TunnelVision mitigation) cannot be armed, and \
@@ -155,8 +182,8 @@ mod platform {
     /// A surviving panic table means the tripwire fired and the host has not
     /// rebooted. That lockdown is deliberately reboot-clearable; silently
     /// stepping over it would resume a session that was declared compromised.
-    fn reject_panic_lockdown(nft: &std::path::Path) -> Result<()> {
-        if table_exists(nft, PANIC_TABLE) {
+    fn reject_panic_lockdown() -> Result<()> {
+        if table_exists(PANIC_TABLE) {
             bail!(
                 "the `inet {PANIC_TABLE}` lockdown is still installed — a previous \
                  session tripped the snooper detector and this host has NOT been \
@@ -172,18 +199,21 @@ mod platform {
     /// (SIGKILL / panic past the guard). Its rules reference an interface name
     /// that may no longer be the uplink, so it is stale policy, not protection:
     /// clear it here rather than layering a second table on top of it.
-    fn clear_stale_killswitch(nft: &std::path::Path) -> Result<()> {
-        if table_exists(nft, KILLSWITCH_TABLE) {
+    fn clear_stale_killswitch() -> Result<()> {
+        if table_exists(KILLSWITCH_TABLE) {
             warn!(
                 "clearing a leftover `inet {KILLSWITCH_TABLE}` table from a \
                  hard-killed previous run"
             );
-            nft_apply(nft, &format!("delete table inet {KILLSWITCH_TABLE}\n"))?;
+            nft_apply(&format!("delete table inet {KILLSWITCH_TABLE}\n"))?;
         }
         Ok(())
     }
 
-    fn table_exists(nft: &std::path::Path, table: &str) -> bool {
+    fn table_exists(table: &str) -> bool {
+        let Some(nft) = nft_binary() else {
+            return false;
+        };
         Command::new(nft)
             .args(["list", "table", "inet", table])
             .stdout(Stdio::null())
@@ -193,7 +223,9 @@ mod platform {
             .unwrap_or(false)
     }
 
-    fn nft_apply(nft: &std::path::Path, script: &str) -> Result<()> {
+    /// See [`crate::preflight::nft_apply`].
+    pub fn nft_apply(script: &str) -> Result<()> {
+        let nft = require_nft()?;
         let mut child = Command::new(nft)
             .args(["-f", "-"])
             .stdin(Stdio::piped())
@@ -324,10 +356,10 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::path::Path;
 
     pub fn run(capture: bool) -> Result<Preflight> {
-        locate_wintun_dll().ok_or_else(|| {
+        // The loader's own search, not a copy of it.
+        crate::tunio::locate_wintun_dll().ok_or_else(|| {
             anyhow!(
                 "wintun.dll not found. Place the architecture-matching DLL next to \
                  tunnel.exe, or in bin\\<arch>\\ (amd64 | arm64 | x86). \
@@ -350,26 +382,5 @@ mod platform {
     fn which(name: &str) -> Option<PathBuf> {
         let path_var = std::env::var_os("PATH")?;
         std::env::split_paths(&path_var).map(|d| d.join(name)).find(|p| p.is_file())
-    }
-
-    fn locate_wintun_dll() -> Option<PathBuf> {
-        let arch = if cfg!(target_arch = "x86_64") {
-            "amd64"
-        } else if cfg!(target_arch = "aarch64") {
-            "arm64"
-        } else {
-            "x86"
-        };
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("wintun.dll"));
-                candidates.push(dir.join(arch).join("wintun.dll"));
-                candidates.push(dir.join("bin").join(arch).join("wintun.dll"));
-            }
-        }
-        candidates.push(PathBuf::from(format!("bin/{}/wintun.dll", arch)));
-        candidates.push(PathBuf::from("wintun.dll"));
-        candidates.into_iter().find(|p: &PathBuf| Path::new(p).exists())
     }
 }

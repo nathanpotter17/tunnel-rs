@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::inspect::TrafficSnapshot;
 use crate::probe;
+use crate::probe::clamp_to;
 use crate::state::{Forward, Shared, Status};
 
 // ---------------------------------------------------------------------------
@@ -485,46 +486,104 @@ fn fit(cols: &[Col], budget: usize, flex_min: usize, flex_max: usize) -> Vec<Col
     keep
 }
 
-/// Pad (or truncate) to exactly `width` characters, always leaving one space of
-/// separation so adjacent columns never run together.
-/// Columns of the probe answer table.
+/// A table's columns, the bounds on its flexible column, and its scroll salt.
 ///
+/// Declared together at module level because a column set means nothing without
+/// the flex bounds `fit` sizes it against — and because the layout tests then
+/// measure the real table rather than a copy that drifts from it.
+struct Table {
+    cols: &'static [Col],
+    /// Floor and ceiling for the single `width: 0` column.
+    flex: (usize, usize),
+    salt: &'static str,
+}
+
+const FLOWS: Table = Table {
+    cols: &[
+        Col::new("REMOTE", 0, false, 0),
+        Col::new("APP", 11, false, 2),
+        Col::new("L4", 5, false, 4),
+        Col::new("RX", 8, true, 1),
+        Col::new("TX", 8, true, 3),
+        Col::new("RATE", 11, true, 0),
+    ],
+    flex: (14, 38),
+    salt: "flows_scroll",
+};
+
+const HOSTS: Table = Table {
+    cols: &[
+        Col::new("HOST", 0, false, 0),
+        Col::new("APP", 10, false, 2),
+        Col::new("FL", 4, true, 3),
+        Col::new("BYTES", 8, true, 1),
+        Col::new("RATE", 10, true, 0),
+    ],
+    flex: (12, 34),
+    salt: "hosts_scroll",
+};
+
+const SERVICES: Table = Table {
+    cols: &[
+        Col::new("PORT", 7, false, 0),
+        Col::new("SERVICE", 0, false, 0),
+        Col::new("L4", 5, false, 4),
+        Col::new("FL", 4, true, 3),
+        Col::new("BYTES", 8, true, 2),
+        Col::new("RATE", 10, true, 1),
+    ],
+    flex: (8, 20),
+    salt: "services_scroll",
+};
+
+/// The one table NOT drawn through [`table_pane`]: each row leads with a painted
+/// swatch, which is not a character cell, so it shares only [`table_cells`].
+const LEGEND: Table = Table {
+    cols: &[
+        Col::new("PROTOCOL", 0, false, 0),
+        Col::new("SHARE", 8, true, 0),
+        Col::new("BYTES", 9, true, 1),
+    ],
+    flex: (8, 22),
+    salt: "proto_legend",
+};
+
 /// NAME is sized for a reverse-DNS name (`38.173.125.74.in-addr.arpa` is 26
 /// characters, and PTR lookups are most of what this widget is pointed at), TYPE
 /// for the longest record label, and TTL for a formatted duration. `DATA` is
 /// capped below the general flexible maximum so that a wide cell spreads its
 /// slack across the other three rather than pouring all of it into the answer.
-///
-/// Module-level so the layout tests measure the real table instead of a copy
-/// that drifts from it — these widths were previously stated twice.
-const PROBE_COLS: [Col; 4] = [
-    Col::new("NAME", 28, false, 2),
-    Col::new("TYPE", 7, false, 1),
-    Col::new("TTL", 8, true, 3),
-    Col::new("DATA", 0, false, 0),
-];
-const PROBE_DATA_MIN: usize = 16;
-const PROBE_DATA_MAX: usize = 45;
+const ANSWERS: Table = Table {
+    cols: &[
+        Col::new("NAME", 28, false, 2),
+        Col::new("TYPE", 7, false, 1),
+        Col::new("TTL", 8, true, 3),
+        Col::new("DATA", 0, false, 0),
+    ],
+    flex: (16, 45),
+    salt: "probe_scroll",
+};
 
 /// Scan results. SERVICE is sized for the longest name in `inspect`'s table
 /// (`shadowsocks`, 11) plus the gutter; BANNER takes the rest, capped so a
 /// chatty service does not push PORT and SERVICE into the left margin.
-const SCAN_COLS: [Col; 3] = [
-    Col::new("PORT", 7, false, 2),
-    Col::new("SERVICE", 14, false, 1),
-    Col::new("BANNER", 0, false, 0),
-];
-const SCAN_BANNER_MIN: usize = 10;
-const SCAN_BANNER_MAX: usize = 60;
+const SCAN: Table = Table {
+    cols: &[
+        Col::new("PORT", 7, false, 2),
+        Col::new("SERVICE", 14, false, 1),
+        Col::new("BANNER", 0, false, 0),
+    ],
+    flex: (10, 60),
+    salt: "scan_scroll",
+};
 
 /// The intel dossier. FIELD holds the longest label (`ALLOCATED`, 9) plus the
 /// gutter; VALUE is sized for an org name, which is the long one.
-const INTEL_COLS: [Col; 2] = [
-    Col::new("FIELD", 11, false, 1),
-    Col::new("VALUE", 0, false, 0),
-];
-const INTEL_VALUE_MIN: usize = 16;
-const INTEL_VALUE_MAX: usize = 64;
+const INTEL: Table = Table {
+    cols: &[Col::new("FIELD", 11, false, 1), Col::new("VALUE", 0, false, 0)],
+    flex: (16, 64),
+    salt: "intel_scroll",
+};
 
 /// Lay a value out in exactly `width` characters, one of which is a gutter.
 ///
@@ -540,9 +599,9 @@ fn pad(s: &str, width: usize, right: bool, gutter: usize) -> String {
     let inner = width.saturating_sub(gutter).max(1);
     let blanks = width.saturating_sub(inner);
     if right {
-        format!("{:>inner$}{}", truncate(s, inner), " ".repeat(blanks), inner = inner)
+        format!("{:>inner$}{}", clamp_to(s, inner), " ".repeat(blanks), inner = inner)
     } else {
-        format!("{:<width$}", truncate(s, inner), width = width)
+        format!("{:<width$}", clamp_to(s, inner), width = width)
     }
 }
 
@@ -567,28 +626,65 @@ fn gutter(col: &Col, next: Option<&Col>) -> usize {
     }
 }
 
-fn table_header(ui: &mut egui::Ui, plan: &[Col], theme: &Theme) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for (i, c) in plan.iter().enumerate() {
-            let g = gutter(c, plan.get(i + 1));
-            mono_cell(ui, pad(c.title, c.width, c.right, g), theme.text_muted);
-        }
-    });
-    header_rule(ui, theme);
+/// Emit one row of padded cells into the CURRENT horizontal layout. Split from
+/// [`table_row`] so the legend can prepend its colour swatch — which is not a
+/// character cell — and still lay the rest of the row out by these rules.
+/// `cell` is asked only for the columns that survived `fit`.
+fn table_cells(ui: &mut egui::Ui, plan: &[Col], cell: impl Fn(&str) -> (String, Color32)) {
+    for (i, c) in plan.iter().enumerate() {
+        let (text, color) = cell(c.title);
+        mono_cell(ui, pad(&text, c.width, c.right, gutter(c, plan.get(i + 1))), color);
+    }
 }
 
-/// Render one row. `cell` is asked only for the columns that survived `fit`, so
-/// a dropped column costs nothing to format.
+/// One row on its own baseline, zero item spacing — the characters are the layout.
 fn table_row(ui: &mut egui::Ui, plan: &[Col], cell: impl Fn(&str) -> (String, Color32)) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for (i, c) in plan.iter().enumerate() {
-            let (text, color) = cell(c.title);
-            let g = gutter(c, plan.get(i + 1));
-            mono_cell(ui, pad(&text, c.width, c.right, g), color);
-        }
+        table_cells(ui, plan, cell);
     });
+}
+
+fn table_header(ui: &mut egui::Ui, plan: &[Col], theme: &Theme) {
+    table_row(ui, plan, |title| (title.to_string(), theme.text_muted));
+    header_rule(ui, theme);
+}
+
+/// Fit `spec` to the cell, draw its header, scroll its rows — the shape every
+/// table in this window has.
+///
+/// `rows` is consumed lazily, so callers keep handing borrows into the shared
+/// snapshot and nothing is collected or cloned on their behalf; emptiness is
+/// peeked rather than counted, because a filter asked for its length walks
+/// twice. Generic, not `dyn`: this runs once per widget per frame.
+fn table_pane<I>(
+    ui: &mut egui::Ui,
+    spec: &Table,
+    wid: u64,
+    empty: &str,
+    theme: &Theme,
+    rows: I,
+    cell: impl Fn(&I::Item, &str) -> (String, Color32),
+) where
+    I: IntoIterator,
+{
+    let plan = fit(spec.cols, char_budget(ui), spec.flex.0, spec.flex.1);
+    table_header(ui, &plan, theme);
+
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
+        empty_note(ui, empty, theme);
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt((spec.salt, wid))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for row in rows {
+                table_row(ui, &plan, |title| cell(&row, title));
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -959,36 +1055,43 @@ fn render_panel(
         });
 }
 
-fn view_selector(ui: &mut egui::Ui, wid: u64, kind: &mut View, theme: &Theme) {
-    egui::ComboBox::from_id_salt(("view", wid))
-        .selected_text(
-            egui::RichText::new(kind.label())
-                .color(theme.text_muted)
-                .size(MONO_PT)
-                .strong()
-                .monospace(),
-        )
-        .width(118.0)
+/// A combo box over a closed set of labelled variants — every selector here.
+///
+/// Options and labelling are passed in rather than demanded through a trait: all
+/// five enums already carry an inherent `ALL` and `label()`, and two of them live
+/// in `probe`, which has no business knowing what a selector is. `selected` is
+/// caller-built because the closed text is deliberately not uniform — the view
+/// selector is a widget title, the rest are subordinate controls.
+fn enum_combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    current: &mut T,
+    options: &[T],
+    label: impl Fn(T) -> &'static str,
+    selected: egui::RichText,
+    width: f32,
+) -> egui::Response {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .width(width)
         .show_ui(ui, |ui| {
-            for option in View::ALL {
-                ui.selectable_value(
-                    kind,
-                    option,
-                    egui::RichText::new(option.label()).size(MONO_PT).monospace(),
-                );
+            // No colour: options inherit the style override, which is what makes
+            // the open list read as primary against the muted closed state.
+            for option in options {
+                ui.selectable_value(current, *option, mono(label(*option), MONO_PT));
             }
-        });
+        })
+        .response
+}
+
+fn view_selector(ui: &mut egui::Ui, wid: u64, kind: &mut View, theme: &Theme) {
+    let selected = mono(kind.label(), MONO_PT).color(theme.text_muted).strong();
+    enum_combo(ui, ("view", wid), kind, &View::ALL, View::label, selected, 118.0);
 }
 
 fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, theme: &Theme) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("QUORUM IO")
-                .color(theme.text_primary)
-                .size(13.0)
-                .strong()
-                .monospace(),
-        );
+        ui.label(mono("QUORUM IO", 13.0).color(theme.text_primary).strong());
 
         ui.add_space(GAP * 2.0);
 
@@ -1003,38 +1106,18 @@ fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, 
             ("OFFLINE", theme.text_muted, "[OFF]")
         };
 
-        ui.label(
-            egui::RichText::new(connstat)
-                .color(status_color)
-                .size(MONO_PT)
-                .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(status_text)
-                .color(status_color)
-                .size(MONO_PT)
-                .monospace(),
-        );
+        mono_cell(ui, connstat.to_string(), status_color);
+        mono_cell(ui, status_text.to_string(), status_color);
 
         if let Some(err) = &status.last_error {
             ui.add_space(GAP);
-            ui.label(
-                egui::RichText::new(truncate(err, 96))
-                    .color(ERROR_RED)
-                    .size(MONO_PT)
-                    .monospace(),
-            )
-            .on_hover_text(err);
+            ui.label(mono(clamp_to(err, 96), MONO_PT).color(ERROR_RED))
+                .on_hover_text(err);
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some(started) = status.started_at {
-                ui.label(
-                    egui::RichText::new(format_duration(started.elapsed()))
-                        .color(theme.text_muted)
-                        .size(MONO_PT)
-                        .monospace(),
-                );
+                mono_cell(ui, format_duration(started.elapsed()), theme.text_muted);
             }
 
             // Four states, because each asks something different of the operator
@@ -1076,36 +1159,20 @@ fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, 
                     ),
                 };
                 ui.add_space(GAP * 2.0);
-                ui.label(
-                    egui::RichText::new(text)
-                        .color(colour)
-                        .size(MONO_PT)
-                        .monospace(),
-                )
-                .on_hover_text(hover);
+                ui.label(mono(text, MONO_PT).color(colour)).on_hover_text(hover);
             }
 
             let total = traffic.total_up + traffic.total_down;
             if total > 0 {
                 ui.add_space(GAP * 2.0);
-                ui.label(
-                    egui::RichText::new(format_bytes(total))
-                        .color(theme.text_secondary)
-                        .size(MONO_PT)
-                        .monospace(),
-                );
+                mono_cell(ui, format_bytes(total), theme.text_secondary);
             }
 
             // The exit descriptor is long and least critical, so it sits between
             // the two anchored groups and is the first thing squeezed out.
             if status.running && !status.exit.is_empty() {
                 ui.add_space(GAP * 2.0);
-                ui.label(
-                    egui::RichText::new(truncate(&status.exit, 42))
-                        .color(theme.text_muted)
-                        .size(MONO_PT)
-                        .monospace(),
-                );
+                mono_cell(ui, clamp_to(&status.exit, 42), theme.text_muted);
             }
         });
     });
@@ -1258,66 +1325,40 @@ fn flows_pane(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         text_field(ui, &mut state.filter, if wide { 130.0 } else { 90.0 }, "filter");
-        egui::ComboBox::from_id_salt(("flow_sort", wid))
-            .selected_text(
-                egui::RichText::new(state.sort.label())
-                    .color(theme.text_muted)
-                    .size(9.0)
-                    .monospace(),
-            )
-            .width(62.0)
-            .show_ui(ui, |ui| {
-                for option in Sort::ALL {
-                    ui.selectable_value(
-                        &mut state.sort,
-                        option,
-                        egui::RichText::new(option.label()).size(MONO_PT).monospace(),
-                    );
-                }
-            });
+        let selected = mono(state.sort.label(), 9.0).color(theme.text_muted);
+        enum_combo(
+            ui,
+            ("flow_sort", wid),
+            &mut state.sort,
+            &Sort::ALL,
+            Sort::label,
+            selected,
+            62.0,
+        );
         ui.checkbox(&mut state.hide_idle, "");
         if wide {
-            ui.label(
-                egui::RichText::new("live only")
-                    .color(theme.text_muted)
-                    .size(9.0)
-                    .monospace(),
-            );
+            ui.label(mono("live only", 9.0).color(theme.text_muted));
         }
     });
     ui.add_space(ROW_GAP);
 
-    render_flows(ui, wid, traffic, &state.filter, state.sort, state.hide_idle, theme);
+    render_flows(ui, wid, traffic, state, theme);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_flows(
     ui: &mut egui::Ui,
     wid: u64,
     traffic: &TrafficSnapshot,
-    filter: &str,
-    sort: Sort,
-    hide_idle: bool,
+    state: &FlowUi,
     theme: &Theme,
 ) {
-    const COLS: [Col; 6] = [
-        Col::new("REMOTE", 0, false, 0),
-        Col::new("APP", 11, false, 2),
-        Col::new("L4", 5, false, 4),
-        Col::new("RX", 8, true, 1),
-        Col::new("TX", 8, true, 3),
-        Col::new("RATE", 11, true, 0),
-    ];
-    let plan = fit(&COLS, char_budget(ui), 14, 38);
-    table_header(ui, &plan, theme);
-
     // Filter and sort by reference — the snapshot is shared, so the view is a
     // vector of borrows, never a clone of the rows.
-    let needle = filter.to_lowercase();
+    let needle = state.filter.to_lowercase();
     let mut rows: Vec<&crate::inspect::FlowRow> = traffic
         .flows
         .iter()
-        .filter(|f| !hide_idle || f.idle_ms <= 5000)
+        .filter(|f| !state.hide_idle || f.idle_ms <= 5000)
         .filter(|f| {
             needle.is_empty()
                 || f.remote.to_lowercase().contains(&needle)
@@ -1326,58 +1367,43 @@ fn render_flows(
         })
         .collect();
 
-    match sort {
+    match state.sort {
         // `flows` arrives byte-sorted, so this branch is already ordered.
         Sort::Bytes => {}
         Sort::Rate => rows.sort_by(|a, b| b.rate.total_cmp(&a.rate)),
         Sort::Recent => rows.sort_by_key(|f| f.idle_ms),
     }
 
-    if rows.is_empty() {
-        empty_note(
-            ui,
-            if traffic.flows.is_empty() {
-                "no traffic yet"
-            } else {
-                "no flows match the filter"
-            },
-            theme,
-        );
-        return;
-    }
+    let empty = if traffic.flows.is_empty() {
+        "no traffic yet"
+    } else {
+        "no flows match the filter"
+    };
 
-    egui::ScrollArea::vertical()
-        .id_salt(("flows_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for f in rows {
-                // Shed / reaped rows are deliberate admission-control actions,
-                // not live conversations — render the whole row muted and swap
-                // the rate cell for a status badge so they don't read as
-                // anomalous up-only or half-open flows.
-                let tagged = !f.status.is_empty();
-                let base = if tagged || f.idle_ms > 5000 {
-                    theme.text_muted
-                } else {
-                    theme.text_secondary
-                };
-                table_row(ui, &plan, |title| match title {
-                    "REMOTE" => (f.remote.clone(), base),
-                    "APP" => (
-                        f.app.to_string(),
-                        if tagged { theme.text_muted } else { proto_color(f.app, theme) },
-                    ),
-                    "L4" => (f.proto.to_string(), theme.text_muted),
-                    "RX" => (format_bytes_short(f.down), base),
-                    "TX" => (format_bytes_short(f.up), base),
-                    _ if tagged => (f.status.to_string(), theme.text_muted),
-                    _ => (
-                        format_rate(f.rate),
-                        if f.rate > 0.0 { theme.text_primary } else { theme.text_muted },
-                    ),
-                });
-            }
-        });
+    table_pane(ui, &FLOWS, wid, empty, theme, rows, |f, title| {
+        // Shed / reaped rows are deliberate admission-control actions, not live
+        // conversations — render the whole row muted and swap the rate cell for
+        // a status badge so they don't read as anomalous up-only or half-open
+        // flows.
+        let tagged = !f.status.is_empty();
+        let base = if tagged || f.idle_ms > 5000 {
+            theme.text_muted
+        } else {
+            theme.text_secondary
+        };
+        match title {
+            "REMOTE" => (f.remote.clone(), base),
+            "APP" => (
+                f.app.to_string(),
+                if tagged { theme.text_muted } else { proto_color(f.app, theme) },
+            ),
+            "L4" => (f.proto.to_string(), theme.text_muted),
+            "RX" => (format_bytes_short(f.down), base),
+            "TX" => (format_bytes_short(f.up), base),
+            _ if tagged => (f.status.to_string(), theme.text_muted),
+            _ => rate_cell(f.rate, theme),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,35 +1484,23 @@ fn render_probe(
             go = true;
         }
 
+        // Not an `enum_combo`: session data, not a closed variant set.
         egui::ComboBox::from_id_salt(("probe_host", wid))
-            .selected_text(
-                egui::RichText::new("ACTIVE")
-                    .color(theme.text_muted)
-                    .size(9.0)
-                    .monospace(),
-            )
+            .selected_text(mono("ACTIVE", 9.0).color(theme.text_muted))
             .width(combo_w)
             .show_ui(ui, |ui| {
                 if traffic.hosts.is_empty() {
-                    ui.label(
-                        egui::RichText::new("no active hosts")
-                            .color(theme.text_muted)
-                            .size(MONO_PT)
-                            .monospace(),
-                    );
+                    ui.label(mono("no active hosts", MONO_PT).color(theme.text_muted));
                 }
                 for h in &traffic.hosts {
                     let line = format!(
                         "{:<22}{:>9} {}",
-                        truncate(&h.ip, 22),
+                        clamp_to(&h.ip, 22),
                         format_bytes_short(h.up + h.down),
                         h.app
                     );
                     if ui
-                        .selectable_label(
-                            p.target == h.ip,
-                            egui::RichText::new(line).size(MONO_PT).monospace(),
-                        )
+                        .selectable_label(p.target == h.ip, mono(line, MONO_PT))
                         .clicked()
                     {
                         p.target = h.ip.clone();
@@ -1498,64 +1512,42 @@ fn render_probe(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
 
-        egui::ComboBox::from_id_salt(("probe_action", wid))
-            .selected_text(
-                egui::RichText::new(action.label())
-                    .color(theme.text_secondary)
-                    .size(9.0)
-                    .monospace(),
-            )
-            .width(combo_w)
-            .show_ui(ui, |ui| {
-                for option in probe::Action::ALL {
-                    ui.selectable_value(
-                        &mut p.action.0,
-                        option,
-                        egui::RichText::new(option.label()).size(MONO_PT).monospace(),
-                    );
-                }
-            })
-            .response
-            .on_hover_text("a DNS lookup, a TCP port scan, or who owns the address");
+        let selected = mono(action.label(), 9.0).color(theme.text_secondary);
+        enum_combo(
+            ui,
+            ("probe_action", wid),
+            &mut p.action.0,
+            &probe::Action::ALL,
+            probe::Action::label,
+            selected,
+            combo_w,
+        )
+        .on_hover_text("a DNS lookup, a TCP port scan, or who owns the address");
 
         match action {
             probe::Action::Nslookup => {
-                egui::ComboBox::from_id_salt(("probe_type", wid))
-                    .selected_text(
-                        egui::RichText::new(p.record.0.label())
-                            .color(theme.text_muted)
-                            .size(9.0)
-                            .monospace(),
-                    )
-                    .width(combo_w)
-                    .show_ui(ui, |ui| {
-                        for option in probe::RecordType::ALL {
-                            ui.selectable_value(
-                                &mut p.record.0,
-                                option,
-                                egui::RichText::new(option.label()).size(MONO_PT).monospace(),
-                            );
-                        }
-                    });
+                let selected = mono(p.record.0.label(), 9.0).color(theme.text_muted);
+                enum_combo(
+                    ui,
+                    ("probe_type", wid),
+                    &mut p.record.0,
+                    &probe::RecordType::ALL,
+                    probe::RecordType::label,
+                    selected,
+                    combo_w,
+                );
             }
             probe::Action::PortScan => {
-                egui::ComboBox::from_id_salt(("probe_ports", wid))
-                    .selected_text(
-                        egui::RichText::new(p.port_mode.label())
-                            .color(theme.text_muted)
-                            .size(9.0)
-                            .monospace(),
-                    )
-                    .width(combo_w)
-                    .show_ui(ui, |ui| {
-                        for option in PortMode::ALL {
-                            ui.selectable_value(
-                                &mut p.port_mode,
-                                option,
-                                egui::RichText::new(option.label()).size(MONO_PT).monospace(),
-                            );
-                        }
-                    });
+                let selected = mono(p.port_mode.label(), 9.0).color(theme.text_muted);
+                enum_combo(
+                    ui,
+                    ("probe_ports", wid),
+                    &mut p.port_mode,
+                    &PortMode::ALL,
+                    PortMode::label,
+                    selected,
+                    combo_w,
+                );
             }
             probe::Action::Intel => {}
         }
@@ -1594,12 +1586,8 @@ fn render_probe(
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(
-                        egui::RichText::new(if busy { "…" } else { "RUN" })
-                            .size(MONO_PT)
-                            .monospace(),
-                    )
-                    .min_size(Vec2::new(button_w, 0.0)),
+                    egui::Button::new(mono(if busy { "…" } else { "RUN" }, MONO_PT))
+                        .min_size(Vec2::new(button_w, 0.0)),
                 )
                 .clicked()
             {
@@ -1673,54 +1661,33 @@ fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
             theme.text_muted,
         ),
         Some(Err(e)) => {
-            ui.label(
-                egui::RichText::new(truncate(e, 220))
-                    .color(ERROR_RED)
-                    .size(MONO_PT)
-                    .monospace(),
-            )
-            .on_hover_text(e);
+            ui.label(mono(clamp_to(e, 220), MONO_PT).color(ERROR_RED))
+                .on_hover_text(e);
         }
         Some(Ok(probe::Outcome::Scan(o))) => scan_status(ui, o, theme),
         Some(Ok(probe::Outcome::Intel(o))) => intel_status(ui, o, theme),
         Some(Ok(probe::Outcome::Dns(o))) => {
             let ok = o.rcode == "NOERROR" && !o.answers.is_empty();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                mono_cell(
-                    ui,
-                    format!("{:<9}", o.rcode),
-                    if ok { OK_GREEN } else { ERROR_RED },
-                );
-                mono_cell(
-                    ui,
-                    format!(
-                        "{:>3} ans  {:>5} ms  {}{}",
-                        o.answers.len(),
-                        o.elapsed.as_millis(),
-                        o.transport,
-                        if o.authoritative { "  auth" } else { "" }
-                    ),
-                    theme.text_secondary,
-                );
-            });
-            ui.label(
-                egui::RichText::new(truncate(
-                    &format!("{} {} @ {}", o.record.label(), o.question, o.server),
-                    120,
-                ))
-                .color(theme.text_muted)
-                .size(9.0)
-                .monospace(),
+            status_line(
+                ui,
+                o.rcode,
+                if ok { OK_GREEN } else { ERROR_RED },
+                format!(
+                    "{:>3} ans  {:>5} ms  {}{}",
+                    o.answers.len(),
+                    o.elapsed.as_millis(),
+                    o.transport,
+                    if o.authoritative { "  auth" } else { "" }
+                ),
+                theme,
+            );
+            caption(
+                ui,
+                &format!("{} {} @ {}", o.record.label(), o.question, o.server),
+                theme,
             );
             if let Some(note) = &o.note {
-                ui.label(
-                    egui::RichText::new(truncate(note, 120))
-                        .color(theme.text_muted)
-                        .size(9.0)
-                        .monospace(),
-                )
-                .on_hover_text(note);
+                caption(ui, note, theme).on_hover_text(note);
             }
         }
     }
@@ -1729,68 +1696,42 @@ fn probe_status(ui: &mut egui::Ui, p: &ProbeUi, theme: &Theme) {
 /// Progress and totals for a scan. Rendered while it runs as well as after, so
 /// the counts are the pending indicator.
 fn scan_status(ui: &mut egui::Ui, o: &probe::ScanOutcome, theme: &Theme) {
-    let complete = o.complete();
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        mono_cell(
-            ui,
-            format!("{:<9}", format!("{} OPEN", o.open.len())),
-            if o.open.is_empty() { theme.text_secondary } else { OK_GREEN },
-        );
-        mono_cell(
-            ui,
-            format!(
-                "{:>4}/{:<5} {:>5} ms  {} closed  {} filtered",
-                o.done,
-                o.total,
-                o.elapsed.as_millis(),
-                o.closed,
-                o.filtered
-            ),
-            theme.text_secondary,
-        );
-    });
-    ui.label(
-        egui::RichText::new(truncate(
-            &format!(
-                "{} {}",
-                o.target,
-                if complete { "scan complete" } else { "scanning…" }
-            ),
-            120,
-        ))
-        .color(theme.text_muted)
-        .size(9.0)
-        .monospace(),
+    status_line(
+        ui,
+        &format!("{} OPEN", o.open.len()),
+        if o.open.is_empty() { theme.text_secondary } else { OK_GREEN },
+        format!(
+            "{:>4}/{:<5} {:>5} ms  {} closed  {} filtered",
+            o.done,
+            o.total,
+            o.elapsed.as_millis(),
+            o.closed,
+            o.filtered
+        ),
+        theme,
+    );
+    caption(
+        ui,
+        &format!(
+            "{} {}",
+            o.target,
+            if o.complete() { "scan complete" } else { "scanning…" }
+        ),
+        theme,
     );
 }
 
 fn intel_status(ui: &mut egui::Ui, o: &probe::IntelOutcome, theme: &Theme) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let known = o.asn.is_some();
-        mono_cell(
-            ui,
-            format!(
-                "{:<9}",
-                o.asn.map(|n| format!("AS{n}")).unwrap_or_else(|| "NO ASN".into())
-            ),
-            if known { OK_GREEN } else { ERROR_RED },
-        );
-        mono_cell(
-            ui,
-            format!("{:>5} ms  {}", o.elapsed.as_millis(), o.target),
-            theme.text_secondary,
-        );
-    });
+    let asn = o.asn.map(|n| format!("AS{n}"));
+    status_line(
+        ui,
+        asn.as_deref().unwrap_or("NO ASN"),
+        if asn.is_some() { OK_GREEN } else { ERROR_RED },
+        format!("{:>5} ms  {}", o.elapsed.as_millis(), o.target),
+        theme,
+    );
     if let Some(note) = &o.note {
-        ui.label(
-            egui::RichText::new(truncate(note, 120))
-                .color(theme.text_muted)
-                .size(9.0)
-                .monospace(),
-        )
-        .on_hover_text(note);
+        caption(ui, note, theme).on_hover_text(note);
     }
 }
 
@@ -1798,41 +1739,21 @@ fn intel_status(ui: &mut egui::Ui, o: &probe::IntelOutcome, theme: &Theme) {
 /// listed: a hundred rows saying "nothing here" is not a finding.
 fn scan_results(ui: &mut egui::Ui, wid: u64, o: &probe::ScanOutcome, theme: &Theme) {
     ui.add_space(ROW_GAP);
-    let plan = fit(&SCAN_COLS, char_budget(ui), SCAN_BANNER_MIN, SCAN_BANNER_MAX);
-    table_header(ui, &plan, theme);
-
-    if o.open.is_empty() {
-        empty_note(
-            ui,
-            if o.complete() { "no open ports found" } else { "scanning…" },
-            theme,
-        );
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt(("scan_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for r in &o.open {
-                table_row(ui, &plan, |title| match title {
-                    "PORT" => (r.port.to_string(), theme.text_primary),
-                    "SERVICE" => (r.service.to_string(), theme.text_secondary),
-                    _ => match &r.banner {
-                        Some(b) => (b.clone(), theme.text_muted),
-                        None => ("—".to_string(), theme.text_muted),
-                    },
-                });
-            }
-        });
+    let empty = if o.complete() { "no open ports found" } else { "scanning…" };
+    table_pane(ui, &SCAN, wid, empty, theme, &o.open, |r, title| match title {
+        "PORT" => (r.port.to_string(), theme.text_primary),
+        "SERVICE" => (r.service.to_string(), theme.text_secondary),
+        _ => match &r.banner {
+            Some(b) => (b.clone(), theme.text_muted),
+            None => ("—".to_string(), theme.text_muted),
+        },
+    });
 }
 
 /// The dossier. Only fields that came back are listed — an absent ASN is a
 /// missing row, not an empty one, so the panel never pads itself with unknowns.
 fn intel_results(ui: &mut egui::Ui, wid: u64, o: &probe::IntelOutcome, theme: &Theme) {
     ui.add_space(ROW_GAP);
-    let plan = fit(&INTEL_COLS, char_budget(ui), INTEL_VALUE_MIN, INTEL_VALUE_MAX);
-    table_header(ui, &plan, theme);
 
     let mut rows: Vec<(&str, String)> = vec![("ADDRESS", o.target.clone())];
     for (field, value) in [
@@ -1849,42 +1770,31 @@ fn intel_results(ui: &mut egui::Ui, wid: u64, o: &probe::IntelOutcome, theme: &T
         }
     }
 
-    egui::ScrollArea::vertical()
-        .id_salt(("intel_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (field, value) in &rows {
-                table_row(ui, &plan, |title| match title {
-                    "FIELD" => ((*field).to_string(), theme.text_muted),
-                    _ => (value.clone(), theme.text_primary),
-                });
-            }
-        });
+    // The empty branch is unreachable: ADDRESS is always a row.
+    table_pane(ui, &INTEL, wid, "", theme, rows, |(field, value), title| {
+        match title {
+            "FIELD" => ((*field).to_string(), theme.text_muted),
+            _ => (value.clone(), theme.text_primary),
+        }
+    });
 }
 
 fn probe_answers(ui: &mut egui::Ui, wid: u64, outcome: &probe::DnsOutcome, theme: &Theme) {
     ui.add_space(ROW_GAP);
-    let plan = fit(&PROBE_COLS, char_budget(ui), PROBE_DATA_MIN, PROBE_DATA_MAX);
-    table_header(ui, &plan, theme);
-
-    if outcome.answers.is_empty() {
-        empty_note(ui, "no records in the answer section", theme);
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt(("probe_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for a in &outcome.answers {
-                table_row(ui, &plan, |title| match title {
-                    "NAME" => (a.name.clone(), theme.text_muted),
-                    "TYPE" => (a.kind.clone(), theme.text_secondary),
-                    "TTL" => (format_ttl(a.ttl), theme.text_muted),
-                    _ => (a.data.clone(), theme.text_primary),
-                });
-            }
-        });
+    table_pane(
+        ui,
+        &ANSWERS,
+        wid,
+        "no records in the answer section",
+        theme,
+        &outcome.answers,
+        |a, title| match title {
+            "NAME" => (a.name.clone(), theme.text_muted),
+            "TYPE" => (a.kind.clone(), theme.text_secondary),
+            "TTL" => (format_ttl(a.ttl), theme.text_muted),
+            _ => (a.data.clone(), theme.text_primary),
+        },
+    );
 }
 
 /// Accept `1.1.1.1`, `1.1.1.1:53`, or a bracketed v6 literal. A bare address is
@@ -1949,26 +1859,20 @@ fn render_protocols(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, them
 /// up column-wise instead of trailing off at whatever width the text happened
 /// to need.
 fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u64, theme: &Theme) {
-    const COLS: [Col; 3] = [
-        Col::new("PROTOCOL", 0, false, 0),
-        Col::new("SHARE", 8, true, 0),
-        Col::new("BYTES", 9, true, 1),
-    ];
     // Three characters are reserved for the colour swatch and its gap.
     const SWATCH: usize = 3;
-    let plan = fit(&COLS, char_budget(ui).saturating_sub(SWATCH), 8, 22);
+    let budget = char_budget(ui).saturating_sub(SWATCH);
+    let plan = fit(LEGEND.cols, budget, LEGEND.flex.0, LEGEND.flex.1);
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         mono_cell(ui, " ".repeat(SWATCH), theme.text_muted);
-        for (i, c) in plan.iter().enumerate() {
-            mono_cell(ui, pad(c.title, c.width, c.right, gutter(c, plan.get(i + 1))), theme.text_muted);
-        }
+        table_cells(ui, &plan, |title| (title.to_string(), theme.text_muted));
     });
     header_rule(ui, theme);
 
     egui::ScrollArea::vertical()
-        .id_salt(("proto_legend", wid))
+        .id_salt((LEGEND.salt, wid))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for a in traffic.apps.iter().filter(|a| a.bytes > 0) {
@@ -1978,17 +1882,14 @@ fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u
                     ui.painter()
                         .rect_filled(sq, Rounding::ZERO, proto_color(a.name, theme));
                     mono_cell(ui, " ".to_string(), theme.text_muted);
-                    for (i, c) in plan.iter().enumerate() {
-                        let (text, color) = match c.title {
-                            "PROTOCOL" => (a.name.to_string(), theme.text_secondary),
-                            "SHARE" => (
-                                format!("{:.1}%", a.bytes as f64 * 100.0 / total as f64),
-                                theme.text_primary,
-                            ),
-                            _ => (format_bytes_short(a.bytes), theme.text_muted),
-                        };
-                        mono_cell(ui, pad(&text, c.width, c.right, gutter(c, plan.get(i + 1))), color);
-                    }
+                    table_cells(ui, &plan, |title| match title {
+                        "PROTOCOL" => (a.name.to_string(), theme.text_secondary),
+                        "SHARE" => (
+                            format!("{:.1}%", a.bytes as f64 * 100.0 / total as f64),
+                            theme.text_primary,
+                        ),
+                        _ => (format_bytes_short(a.bytes), theme.text_muted),
+                    });
                 });
             }
         });
@@ -2061,87 +1962,54 @@ fn draw_donut(ui: &mut egui::Ui, traffic: &TrafficSnapshot, total: u64, dia: f32
 
 /// Unique remote hosts: every conversation with one address on one row.
 fn render_hosts(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, theme: &Theme) {
-    const COLS: [Col; 5] = [
-        Col::new("HOST", 0, false, 0),
-        Col::new("APP", 10, false, 2),
-        Col::new("FL", 4, true, 3),
-        Col::new("BYTES", 8, true, 1),
-        Col::new("RATE", 10, true, 0),
-    ];
-    let plan = fit(&COLS, char_budget(ui), 12, 34);
-    table_header(ui, &plan, theme);
-
-    if traffic.hosts.is_empty() {
-        empty_note(ui, "no remote hosts yet", theme);
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt(("hosts_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for h in &traffic.hosts {
-                let base = if h.idle_ms > 5000 {
-                    theme.text_muted
-                } else {
-                    theme.text_secondary
-                };
-                table_row(ui, &plan, |title| match title {
-                    "HOST" => (h.ip.clone(), base),
-                    "APP" => (h.app.to_string(), proto_color(h.app, theme)),
-                    "FL" => (h.flows.to_string(), theme.text_muted),
-                    "BYTES" => (format_bytes_short(h.up + h.down), base),
-                    _ => (
-                        format_rate(h.rate),
-                        if h.rate > 0.0 { theme.text_primary } else { theme.text_muted },
-                    ),
-                });
+    table_pane(
+        ui,
+        &HOSTS,
+        wid,
+        "no remote hosts yet",
+        theme,
+        &traffic.hosts,
+        |h, title| {
+            let base = if h.idle_ms > 5000 {
+                theme.text_muted
+            } else {
+                theme.text_secondary
+            };
+            match title {
+                "HOST" => (h.ip.clone(), base),
+                "APP" => (h.app.to_string(), proto_color(h.app, theme)),
+                "FL" => (h.flows.to_string(), theme.text_muted),
+                "BYTES" => (format_bytes_short(h.up + h.down), base),
+                _ => rate_cell(h.rate, theme),
             }
-        });
+        },
+    );
 }
 
 /// Remote service ports: what this host is actually talking to, by destination.
 fn render_services(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, theme: &Theme) {
-    const COLS: [Col; 6] = [
-        Col::new("PORT", 7, false, 0),
-        Col::new("SERVICE", 0, false, 0),
-        Col::new("L4", 5, false, 4),
-        Col::new("FL", 4, true, 3),
-        Col::new("BYTES", 8, true, 2),
-        Col::new("RATE", 10, true, 1),
-    ];
-    let plan = fit(&COLS, char_budget(ui), 8, 20);
-    table_header(ui, &plan, theme);
-
-    if traffic.ports.is_empty() {
-        empty_note(ui, "no services yet", theme);
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt(("services_scroll", wid))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for p in &traffic.ports {
-                table_row(ui, &plan, |title| match title {
-                    "PORT" => (p.port.to_string(), theme.text_secondary),
-                    "SERVICE" => {
-                        if p.service.is_empty() {
-                            ("—".to_string(), theme.text_muted)
-                        } else {
-                            (p.service.to_string(), theme.text_secondary)
-                        }
-                    }
-                    "L4" => (p.l4.to_string(), theme.text_muted),
-                    "FL" => (p.flows.to_string(), theme.text_muted),
-                    "BYTES" => (format_bytes_short(p.up + p.down), theme.text_secondary),
-                    _ => (
-                        format_rate(p.rate),
-                        if p.rate > 0.0 { theme.text_primary } else { theme.text_muted },
-                    ),
-                });
+    table_pane(
+        ui,
+        &SERVICES,
+        wid,
+        "no services yet",
+        theme,
+        &traffic.ports,
+        |p, title| match title {
+            "PORT" => (p.port.to_string(), theme.text_secondary),
+            "SERVICE" => {
+                if p.service.is_empty() {
+                    ("—".to_string(), theme.text_muted)
+                } else {
+                    (p.service.to_string(), theme.text_secondary)
+                }
             }
-        });
+            "L4" => (p.l4.to_string(), theme.text_muted),
+            "FL" => (p.flows.to_string(), theme.text_muted),
+            "BYTES" => (format_bytes_short(p.up + p.down), theme.text_secondary),
+            _ => rate_cell(p.rate, theme),
+        },
+    );
 }
 
 /// Stacked share bar plus per-protocol bars: the compact form of the same data
@@ -2276,32 +2144,39 @@ fn header_rule(ui: &mut egui::Ui, theme: &Theme) {
 fn empty_note(ui: &mut egui::Ui, text: &str, theme: &Theme) {
     ui.vertical_centered(|ui| {
         ui.add_space(GAP);
-        ui.label(
-            egui::RichText::new(text)
-                .color(theme.text_muted)
-                .size(MONO_PT)
-                .monospace(),
-        );
+        ui.label(mono(text, MONO_PT).color(theme.text_muted));
     });
 }
 
 fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, value_color: Color32, theme: &Theme) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.label(
-            egui::RichText::new(format!("{:<8}", label))
-                .color(theme.text_muted)
-                .size(MONO_PT)
-                .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(value)
-                .color(value_color)
-                .size(MONO_PT)
-                .monospace()
-                .strong(),
-        );
+        mono_cell(ui, format!("{label:<8}"), theme.text_muted);
+        ui.label(mono(value, MONO_PT).color(value_color).strong());
     });
+}
+
+/// The line above a probe's results: a nine-character verdict badge, then the
+/// measurements. All three actions publish it, so the measurements stay put when
+/// the action changes.
+fn status_line(ui: &mut egui::Ui, badge: &str, badge_color: Color32, detail: String, theme: &Theme) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        mono_cell(ui, format!("{badge:<9}"), badge_color);
+        mono_cell(ui, detail, theme.text_secondary);
+    });
+}
+
+/// The muted line beneath a status row, clamped to what the widest widget shows
+/// without wrapping. Returns the response so a caller can hang hover text on it.
+fn caption(ui: &mut egui::Ui, text: &str, theme: &Theme) -> egui::Response {
+    ui.label(mono(clamp_to(text, 120), 9.0).color(theme.text_muted))
+}
+
+/// Primary while the rate is moving, muted once it stops. Three tables, one answer.
+fn rate_cell(rate: f64, theme: &Theme) -> (String, Color32) {
+    let color = if rate > 0.0 { theme.text_primary } else { theme.text_muted };
+    (format_rate(rate), color)
 }
 
 /// Stable color per application protocol, tuned to read on the dark surfaces.
@@ -2347,58 +2222,40 @@ fn text_field(ui: &mut egui::Ui, buf: &mut String, width: f32, hint: &str) -> eg
     )
 }
 
-fn mono_cell(ui: &mut egui::Ui, text: String, color: Color32) {
-    ui.label(
-        egui::RichText::new(text)
-            .color(color)
-            .size(MONO_PT)
-            .monospace(),
-    );
+/// The one place a `RichText` is given its family, so a cell and the hover text
+/// beside it cannot drift apart. Colour and weight are chained on by the caller.
+fn mono(text: impl Into<String>, size: f32) -> egui::RichText {
+    egui::RichText::new(text).size(size).monospace()
 }
 
-/// Truncate to `max` characters. Counts chars, not bytes: an address string is
-/// ASCII, but a protocol label need not stay that way, and slicing mid-codepoint
-/// panics.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
+fn mono_cell(ui: &mut egui::Ui, text: String, color: Color32) {
+    ui.label(mono(text, MONO_PT).color(color));
+}
+
+/// The binary byte ladder, `suffix` glued to the unit: `""` for a quantity,
+/// `"/s"` for a rate. One ladder, because a header reading `1.2 MB` beside a row
+/// reading `1180 KB/s` for the same number is a discrepancy someone must resolve.
+fn format_scaled(v: f64, suffix: &str) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if v >= GB {
+        format!("{:.2} GB{suffix}", v / GB)
+    } else if v >= MB {
+        format!("{:.2} MB{suffix}", v / MB)
+    } else if v >= KB {
+        format!("{:.1} KB{suffix}", v / KB)
     } else {
-        let keep = max.saturating_sub(1);
-        let mut out: String = s.chars().take(keep).collect();
-        out.push('…');
-        out
+        format!("{v:.0} B{suffix}")
     }
 }
 
 fn format_rate(bps: f64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    if bps >= GB {
-        format!("{:.2} GB/s", bps / GB)
-    } else if bps >= MB {
-        format!("{:.2} MB/s", bps / MB)
-    } else if bps >= KB {
-        format!("{:.1} KB/s", bps / KB)
-    } else {
-        format!("{:.0} B/s", bps)
-    }
+    format_scaled(bps, "/s")
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
+    format_scaled(bytes as f64, "")
 }
 
 fn format_bytes_short(bytes: u64) -> String {
@@ -2454,28 +2311,26 @@ mod tests {
     /// than a source file will hold, and the test below is what says so.
     const SPECIAL_GLYPHS: &str = "—…";
 
-    const FLOW_COLS: [Col; 6] = [
-        Col::new("REMOTE", 0, false, 0),
-        Col::new("APP", 11, false, 2),
-        Col::new("L4", 5, false, 4),
-        Col::new("RX", 8, true, 1),
-        Col::new("TX", 8, true, 3),
-        Col::new("RATE", 11, true, 0),
-    ];
+    /// Fit a table by its own declared bounds — the same call `table_pane` makes,
+    /// so what the tests measure is what the window draws.
+    fn plan_of(t: &Table, budget: usize) -> Vec<Col> {
+        fit(t.cols, budget, t.flex.0, t.flex.1)
+    }
+
+    fn titles(plan: &[Col]) -> Vec<&'static str> {
+        plan.iter().map(|c| c.title).collect()
+    }
 
     fn at(budget: usize) -> Vec<&'static str> {
-        fit(&FLOW_COLS, budget, 14, 30)
-            .iter()
-            .map(|c| c.title)
-            .collect()
+        titles(&fit(FLOWS.cols, budget, 14, 30))
     }
 
     #[test]
     fn wide_budget_keeps_every_column_and_widens_the_flexible_one() {
         assert_eq!(at(80), ["REMOTE", "APP", "L4", "RX", "TX", "RATE"]);
         // 43 fixed characters; REMOTE takes the slack first, up to its cap.
-        assert_eq!(fit(&FLOW_COLS, 60, 14, 38)[0].width, 17);
-        assert_eq!(fit(&FLOW_COLS, 80, 14, 38)[0].width, 37);
+        assert_eq!(plan_of(&FLOWS, 60)[0].width, 17);
+        assert_eq!(plan_of(&FLOWS, 80)[0].width, 37);
     }
 
     #[test]
@@ -2483,7 +2338,7 @@ mod tests {
         // A very wide panel: REMOTE saturates at its 38-character cap and the
         // remaining 129 characters are shared among the OTHERS, so the row spans
         // the full width without one enormous gap after the address.
-        let plan = fit(&FLOW_COLS, 210, 14, 38);
+        let plan = plan_of(&FLOWS, 210);
         assert_eq!(plan.len(), 6);
         assert_eq!(plan.iter().map(|c| c.width).sum::<usize>(), 210);
         assert_eq!(plan[0].width, 38);
@@ -2493,7 +2348,7 @@ mod tests {
         // At the width a real FLOWS widget gets, no column runs away with the
         // slack: the widest is within a few characters of the second widest,
         // rather than 2.3x it as when the flexible column took a second helping.
-        let plan = fit(&FLOW_COLS, 140, 14, 38);
+        let plan = plan_of(&FLOWS, 140);
         assert_eq!(plan.iter().map(|c| c.width).sum::<usize>(), 140);
         let mut widths: Vec<usize> = plan.iter().map(|c| c.width).collect();
         widths.sort_unstable();
@@ -2561,27 +2416,39 @@ mod tests {
 
     #[test]
     fn flexible_column_never_falls_below_its_floor() {
-        let plan = fit(&FLOW_COLS, 4, 14, 30);
+        let plan = fit(FLOWS.cols, 4, 14, 30);
         assert_eq!(plan.iter().find(|c| c.title == "REMOTE").unwrap().width, 14);
     }
 
     #[test]
-    fn every_table_keeps_exactly_one_flexible_column() {
-        // `fit` gives all slack to the single zero-width column; two would
-        // silently split it and the header would stop lining up with the rows.
-        for cols in [FLOW_COLS.as_slice(), PROBE_COLS.as_slice()] {
-            assert_eq!(cols.iter().filter(|c| c.width == 0).count(), 1);
+    fn the_table_registry_is_well_formed() {
+        // Two silent failures, checked over every table rather than a sample now
+        // that they are declared in one place: `fit` gives all slack to the
+        // single zero-width column, and two of them would split it and unalign
+        // the header from the rows; a shared salt would join two widgets' scroll
+        // offsets whenever both were on screen.
+        let tables = [&FLOWS, &HOSTS, &SERVICES, &LEGEND, &ANSWERS, &SCAN, &INTEL];
+        for t in tables {
+            assert_eq!(
+                t.cols.iter().filter(|c| c.width == 0).count(),
+                1,
+                "{} has the wrong number of flexible columns",
+                t.salt
+            );
+            assert!(t.flex.0 <= t.flex.1, "{} has an inverted flex range", t.salt);
         }
+        let mut salts: Vec<&str> = tables.iter().map(|t| t.salt).collect();
+        let count = salts.len();
+        salts.sort_unstable();
+        salts.dedup();
+        assert_eq!(salts.len(), count, "two tables share a scroll salt");
     }
 
     #[test]
     fn the_probe_table_keeps_the_answer_when_the_cell_is_narrow() {
         // DATA is the answer; NAME echoes the question that is already on the
         // status line above. In a very narrow widget the answer is what survives.
-        let narrow: Vec<&str> = fit(&PROBE_COLS, 26, PROBE_DATA_MIN, PROBE_DATA_MAX)
-            .iter()
-            .map(|c| c.title)
-            .collect();
+        let narrow = titles(&plan_of(&ANSWERS, 26));
         assert!(narrow.contains(&"DATA"));
         assert!(!narrow.contains(&"TTL"));
     }
@@ -2592,7 +2459,7 @@ mod tests {
         // has to fit at the width the widget actually gets (~78 characters in
         // the default five-widget layout) rather than be shortened to an ellipsis.
         let sample = "38.173.125.74.in-addr.arpa";
-        let plan = fit(&PROBE_COLS, 78, PROBE_DATA_MIN, PROBE_DATA_MAX);
+        let plan = plan_of(&ANSWERS, 78);
         let name = plan.iter().find(|c| c.title == "NAME").expect("NAME dropped at 78");
         assert_eq!(
             pad(sample, name.width, false, 1).trim_end(),
@@ -2603,11 +2470,7 @@ mod tests {
 
         // At the narrowest a widget can be, the name still survives: the TTL is
         // what goes, because it is the field you can most afford to lose.
-        let narrow: Vec<&str> = fit(&PROBE_COLS, 54, PROBE_DATA_MIN, PROBE_DATA_MAX)
-            .iter()
-            .map(|c| c.title)
-            .collect();
-        assert_eq!(narrow, ["NAME", "TYPE", "DATA"]);
+        assert_eq!(titles(&plan_of(&ANSWERS, 54)), ["NAME", "TYPE", "DATA"]);
     }
 
     /// Render one row of `cols` as the character grid it becomes on screen.
@@ -2622,7 +2485,7 @@ mod tests {
     fn the_scan_and_intel_tables_read_as_separated_columns() {
         // Same standard as the probe answer table: these are character grids, so
         // the grid is the only honest check.
-        let scan = fit(&SCAN_COLS, 78, SCAN_BANNER_MIN, SCAN_BANNER_MAX);
+        let scan = plan_of(&SCAN, 78);
         assert_eq!(scan.iter().map(|c| c.width).sum::<usize>(), 78);
         let row = grid_row(&scan, |t| match t {
             "PORT" => "22".into(),
@@ -2640,7 +2503,7 @@ mod tests {
         let service = scan.iter().find(|c| c.title == "SERVICE").unwrap();
         assert_eq!(pad("shadowsocks", service.width, false, 1).trim_end(), "shadowsocks");
 
-        let intel = fit(&INTEL_COLS, 78, INTEL_VALUE_MIN, INTEL_VALUE_MAX);
+        let intel = plan_of(&INTEL, 78);
         assert_eq!(intel.iter().map(|c| c.width).sum::<usize>(), 78);
         let dossier = grid_row(&intel, |t| match t {
             "FIELD" => "ALLOCATED".into(),
@@ -2697,20 +2560,14 @@ mod tests {
     fn a_probe_row_reads_as_four_separated_columns() {
         // The rendered result, not just the invariants behind it: this table is
         // a character grid, so the only honest check is what the grid says.
-        let plan = fit(&PROBE_COLS, 78, PROBE_DATA_MIN, PROBE_DATA_MAX);
-        let render = |v: &dyn Fn(&str) -> &str| -> String {
-            plan.iter()
-                .enumerate()
-                .map(|(i, c)| pad(v(c.title), c.width, c.right, gutter(c, plan.get(i + 1))))
-                .collect()
-        };
-        let row = render(&|title| match title {
-            "NAME" => "38.173.125.74.in-addr.arpa",
-            "TYPE" => "PTR",
-            "TTL" => "1h",
-            _ => "fra24s25-in-f6.1e100.net",
+        let plan = plan_of(&ANSWERS, 78);
+        let row = grid_row(&plan, |title| match title {
+            "NAME" => "38.173.125.74.in-addr.arpa".into(),
+            "TYPE" => "PTR".into(),
+            "TTL" => "1h".into(),
+            _ => "fra24s25-in-f6.1e100.net".into(),
         });
-        let head = render(&|title| title);
+        let head = grid_row(&plan, |title| title.to_string());
 
         assert_eq!(row.chars().count(), 78);
         assert_eq!(head.chars().count(), 78);
@@ -2722,11 +2579,11 @@ mod tests {
     }
 
     #[test]
-    fn truncate_is_codepoint_safe() {
-        assert_eq!(truncate("1.2.3.4:443", 20), "1.2.3.4:443");
-        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+    fn clamping_is_codepoint_safe() {
+        assert_eq!(clamp_to("1.2.3.4:443", 20), "1.2.3.4:443");
+        assert_eq!(clamp_to("abcdefghij", 5), "abcd…");
         // Multi-byte: a byte slice at 5 would land mid-codepoint and panic.
-        assert_eq!(truncate("ααααα", 3), "αα…");
+        assert_eq!(clamp_to("ααααα", 3), "αα…");
     }
 
     #[test]
@@ -2741,6 +2598,7 @@ mod tests {
         assert_eq!(format_ttl(3600), "1h");
         assert_eq!(format_ttl(86_400 * 2), "2d");
     }
+
 
     #[test]
     fn every_view_is_reachable_from_the_selector() {
@@ -2944,7 +2802,7 @@ mod tests {
             "LOOKUP", "ACTIVE", "filter", "live only", "resolver", "host or address",
             "no active hosts", "no traffic yet", "no flows match the filter", "no widgets",
             "no remote hosts yet", "no services yet", "no classified traffic yet",
-            "no records in the answer section", "pick a host or type a name, then LOOKUP",
+            "no records in the answer section", "pick a host or type a name, then RUN",
             "nameserver to ask; defaults to the resolver the tunnel pinned",
             "RX TX RATIO PKT MEAN TCP UDP LIVE ARCHIV HOSTS SVCS DOWN UP FLOWS PKTS peak",
             "REMOTE APP L4 RATE HOST BYTES FL PORT SERVICE PROTOCOL SHARE NAME TYPE TTL DATA",

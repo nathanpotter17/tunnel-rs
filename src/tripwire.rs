@@ -66,14 +66,41 @@ fn nuke(ctx: &Ctx, reason: &str) -> ! {
     // Slam the reboot-clearable kernel block. It holds AFTER we exit (nothing has
     // to stay alive to enforce it) and clears on reboot. No adapter disable, no
     // child process, nothing to race.
-    platform::lockdown();
+    let locked = platform::lockdown();
+
+    // What the operator is told depends on whether that worked, because
+    // `exit(101)` below skips every Drop: on a failed lockdown the guards never
+    // restore anything and no filter replaced them, so the machine is left
+    // exposed with a confirmed snooper on it. Rebooting does not help there —
+    // on Windows it comes back equally open, and on Linux it also clears the
+    // kill-switch table that `exit` happened to leave behind. The only action
+    // that is right under every failure is to take the machine off the wire.
+    //
+    // Branched rather than appended: printing "locked down" unconditionally put
+    // a reassurance underneath the warning that contradicts it, and the
+    // reassurance had the last word.
+    //
+    // Stated without naming a mechanism, so this reads the same whichever
+    // platform's filter did or did not install.
+    let (log_line, console_line) = if locked {
+        (
+            "Locking down. User must reboot and rotate keys — a snooper was found.",
+            "[tunnel] Network locked down. Reboot and rotate keys — a snooper was found.\n",
+        )
+    } else {
+        (
+            "LOCKDOWN FAILED — traffic is NOT blocked. Disconnect this machine now.",
+            "[tunnel] LOCKDOWN FAILED — traffic is NOT blocked.\n\
+             [tunnel] Disconnect this machine from the network now, then reboot and rotate keys.\n",
+        )
+    };
 
     // Console only — the process is about to die; make the reason unmistakable on
     // both the tracing sink and raw stderr (in case the layer is mid-flush).
     error!("SNOOPER DETECTED: {reason}");
-    error!("Locking down. User must reboot and rotate keys — a snooper was found.");
+    error!("{log_line}");
     eprintln!("\n[tunnel] SNOOPER DETECTED: {reason}");
-    eprintln!("[tunnel] Network locked down. Reboot and rotate keys — a snooper was found.\n");
+    eprintln!("{console_line}");
     use std::io::Write;
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
@@ -220,36 +247,25 @@ mod platform {
     /// is cleared on reboot (nft runtime rules are not persisted). Loopback is
     /// spared so the desktop isn't wedged; priority -300 puts it ahead of
     /// everything.
-    pub fn lockdown() {
-        let script = "add table inet tunnel_panic\n\
+    /// Returns whether the block is actually in place; `nuke` tells the operator
+    /// which of two very different situations they are in.
+    pub fn lockdown() -> bool {
+        const SCRIPT: &str = "add table inet tunnel_panic\n\
              flush table inet tunnel_panic\n\
              add chain inet tunnel_panic input { type filter hook input priority -300 ; policy drop ; }\n\
              add chain inet tunnel_panic output { type filter hook output priority -300 ; policy drop ; }\n\
              add chain inet tunnel_panic forward { type filter hook forward priority -300 ; policy drop ; }\n\
              add rule inet tunnel_panic input iifname \"lo\" accept\n\
              add rule inet tunnel_panic output oifname \"lo\" accept\n";
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        match Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut c) => {
-                if let Some(mut si) = c.stdin.take() {
-                    let _ = si.write_all(script.as_bytes());
-                }
-                match c.wait_with_output() {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => warn!(
-                        "lockdown nft block failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
-                    Err(e) => warn!("lockdown nft block wait failed: {e}"),
-                }
+        // Through preflight, which knows where `nft` is. With the bare name this
+        // silently did nothing on a host whose PATH omits /usr/sbin — on the one
+        // path where doing nothing means a confirmed snooper keeps the network.
+        match crate::preflight::nft_apply(SCRIPT) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("lockdown nft block failed: {e}");
+                false
             }
-            Err(e) => warn!("lockdown nft block spawn failed (nftables installed?): {e}"),
         }
     }
 
@@ -355,44 +371,65 @@ mod platform {
         }
     }
 
-    /// True iff both half-default routes still point at the TUN ifindex. Only
-    /// consulted when a leak is already suspected (a rare read, off the hot path).
+    /// True iff both /1 capture routes still point at the TUN. Reads the IPv4
+    /// forwarding table in-process: Get-NetRoute meant two powershell spawns
+    /// here, and this is on the tripwire's decision path — four spawns per
+    /// confirmation, ~1s of latency ahead of a µs teardown.
     pub fn tunnel_routes_intact(tun_ifindex: &str) -> bool {
         let tun: u32 = match tun_ifindex.parse() {
             Ok(v) => v,
             Err(_) => return false,
         };
-        route_has_index("0.0.0.0/1", tun) && route_has_index("128.0.0.0/1", tun)
-    }
 
-    fn route_has_index(prefix: &str, idx: u32) -> bool {
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "(Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue).InterfaceIndex"
-                ),
-            ])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse::<u32>().ok())
-                .any(|i| i == idx),
-            _ => false,
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        // AF_INET (2). Table is heap-allocated by the OS; freed below.
+        let rc = unsafe { GetIpForwardTable2(AF_INET, &mut table) };
+        if rc != 0 || table.is_null() {
+            return false;
         }
+
+        let (mut lo, mut hi) = (false, false);
+        unsafe {
+            let n = (*table).NumEntries as usize;
+            let rows = (*table).Table.as_ptr();
+            for i in 0..n {
+                let row = &*rows.add(i);
+                if row.InterfaceIndex != tun {
+                    continue;
+                }
+                let p = &row.DestinationPrefix;
+                if p.PrefixLength != 1 || p.Prefix.si_family != AF_INET {
+                    continue;
+                }
+                // Network-order octets of the destination address.
+                match p.Prefix.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes() {
+                    [0, 0, 0, 0] => lo = true,     // 0.0.0.0/1 on the TUN
+                    [128, 0, 0, 0] => hi = true,   // 128.0.0.0/1 on the TUN
+                    _ => {}
+                }
+            }
+            FreeMibTable(table as *const _);
+        }
+        lo && hi
     }
 
     /// The lockdown: a NON-dynamic WFP block that SURVIVES our process exit and is
     /// cleared on reboot (it is not flagged persistent). No child process. Blocks
     /// all new outbound connects and inbound accepts (v4 + v6), sparing loopback
     /// so the machine isn't wedged before the user can reboot.
-    pub fn lockdown() {
-        if let Err(e) = wfp_block() {
-            warn!("in-kernel WFP lockdown failed ({e}); traffic may not be fully blocked — reboot");
-            eprintln!("[tunnel] WARNING: kernel lockdown failed: {e} — reboot to be safe");
+    /// Returns whether the block is actually in place; `nuke` tells the operator
+    /// which of two very different situations they are in. The advice does not
+    /// live here: this process's kill switch is a DYNAMIC WFP session, so exiting
+    /// tears it down for us, and the `/1` routes die with the wintun adapter —
+    /// a failed lockdown leaves the host on its original default route with a
+    /// confirmed snooper on it, which a reboot does nothing to change.
+    pub fn lockdown() -> bool {
+        match wfp_block() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("in-kernel WFP lockdown failed: {e}");
+                false
+            }
         }
     }
 
@@ -527,5 +564,10 @@ mod platform {
     pub fn tunnel_routes_intact(_tun: &str) -> bool {
         true
     }
-    pub fn lockdown() {}
+    /// Nothing to install, so nothing is in place. Unreachable in practice —
+    /// `killswitch::install` fails here and the engine bails before the tripwire
+    /// is spawned — but `false` is the only honest answer if it ever were.
+    pub fn lockdown() -> bool {
+        false
+    }
 }
