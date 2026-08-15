@@ -53,6 +53,8 @@ ARGS:
 
 OPTIONS:
     -s, --settings <P>   Settings file (same as the positional form)
+    -d, --direct         Direct exit on built-in defaults: transparent proxy out
+                         the host uplink, dns 1.1.1.1, any [wireguard] ignored
         --no-route       Do not redirect the default route into the TUN
         --log            Also write the full log transcript to
                          tunnel-<timestamp>.txt, next to the session flow CSV
@@ -152,6 +154,7 @@ async fn main() -> Result<()> {
 
     let mut settings_path: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut direct_mode = false;
     let mut install_route = true;
     let mut log_to_file = false;
     let mut positional: Vec<String> = Vec::new();
@@ -162,6 +165,7 @@ async fn main() -> Result<()> {
             "-h" | "--help" => { print_usage(); return Ok(()); }
             "-V" | "--version" => { println!("tunnel {VERSION}"); return Ok(()); }
             "-v" | "--verbose" => verbose = true,
+            "-d" | "--direct" => direct_mode = true,
             "--no-route" => install_route = false,
             "--log" => log_to_file = true,
             "-s" | "--settings" => { i += 1; settings_path = Some(PathBuf::from(args.get(i).context("--settings needs a path")?)); }
@@ -216,7 +220,18 @@ async fn main() -> Result<()> {
     if settings_explicit && !settings_path.exists() {
         bail!("settings file not found: {}", settings_path.display());
     }
-    let settings = Settings::load_or_default(&settings_path)?;
+    let mut settings = Settings::load_or_default(&settings_path)?;
+
+    // `--direct` and a settings file are alternatives, not a combination — the
+    // file is there to describe a WireGuard exit. So --direct takes the Direct
+    // defaults wholesale: no exit (which is what selects the transparent proxy
+    // out the uplink) and the built-in resolver, never a peer-internal one that
+    // nothing on the uplink can answer.
+    if direct_mode {
+        settings.wireguard = None;
+        settings.dns = Settings::default().dns;
+        tracing::info!("--direct: Direct exit out the uplink, dns {}", settings.dns);
+    }
 
     // Environment gate. Every precondition the engine needs is checked BEFORE
     // the TUN exists, the route is hijacked, or the kill switch is armed — so a
