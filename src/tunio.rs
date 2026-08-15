@@ -43,9 +43,24 @@ mod platform {
     use std::sync::Arc;
 
     const RING_CAPACITY: u32 = 0x400000; // 4 MB
-    /// Fixed wintun adapter name. Reclaimed at startup and removed on teardown so
-    /// a session never adopts a prior session's adapter (and its stale config).
+    /// Fixed wintun adapter name — the friendly name Windows shows in adapter
+    /// lists. Reclaimed at startup and removed on teardown so a session never
+    /// adopts a prior session's adapter (and its stale config).
     const ADAPTER_NAME: &str = "tunnel0";
+    /// Device description, i.e. wintun's "tunnel type". Cosmetic; it is what sits
+    /// in the description column beside [`ADAPTER_NAME`].
+    const ADAPTER_TYPE: &str = "Tunnel";
+
+    // The adapter GUID is deliberately NOT pinned. Wintun derives both the device
+    // instance id (`SWD\Wintun\{GUID}`) and, through it, the NET_LUID from the
+    // GUID — so a fixed GUID would hand every session the same stable, externally
+    // readable interface identity to fingerprint and target. A session-random GUID
+    // keeps that identity fresh per run. Only the NAME is stable, because routing,
+    // DNS pinning, and the kill switch all reference it.
+    //
+    // The cost of a random GUID is that the identity to clean up is only known at
+    // runtime — so it is carried on [`KeepAlive`] rather than read off a constant,
+    // and a leftover is found by name (see the reclamation in `create`).
 
     /// RAII teardown guard for the wintun interface. Owns everything required to
     /// stop the worker threads/tasks and release every handle to the adapter —
@@ -59,6 +74,11 @@ mod platform {
         writer: Option<tokio::task::JoinHandle<()>>,
         stopping: Arc<AtomicBool>,
         name: String,
+        /// This session's adapter GUID, captured at create time. It IS the device
+        /// instance id, and it is the only handle on the interface that survives
+        /// every handle being dropped — so teardown can remove the device it
+        /// actually created rather than whatever currently answers to the name.
+        guid: u128,
     }
 
     impl KeepAlive {
@@ -89,6 +109,11 @@ mod platform {
             // removes the interface from the system.
             self.session.take();
             self.adapter.take();
+            // Belt and suspenders: the close above is the driver's cooperation,
+            // not a guarantee. Sweep this session's device instance so no path out
+            // of this process can leave the interface installed for the next
+            // session — or for whatever the user has bound to it.
+            remove_device_instance(self.guid);
             tracing::info!("TUN '{}' removed", self.name);
         }
     }
@@ -110,6 +135,7 @@ mod platform {
             }
             self.session.take();
             self.adapter.take();
+            remove_device_instance(self.guid);
         }
     }
 
@@ -147,20 +173,53 @@ mod platform {
             .with_context(|| format!("failed to load wintun dll from {}", dll.display()))?;
 
         // Startup reclamation: a clean shutdown removes the adapter, so a leftover
-        // means a prior run was hard-killed. Opening then dropping the orphan
-        // closes its last handle, removing it. NO create-then-open fallback: we
-        // never adopt a stale adapter (that is what bound us to old config).
+        // means a prior run was hard-killed (or tripped the tripwire lockdown,
+        // which exits past every Drop). Its GUID died with that run, so recover it
+        // by name — `Adapter::open` resolves the friendly name to a GUID — and
+        // then remove that device instance. Opening the orphan and dropping the
+        // handle does NOT remove it, because wintun only removes adapters the
+        // closing process itself created; that is why leftovers used to survive
+        // into the next session. NO create-then-open fallback: we never adopt a
+        // stale adapter (that is what bound us to old config).
         if let Ok(stale) = wintun::Adapter::open(&wintun, ADAPTER_NAME) {
-            drop(stale);
+            let stale_guid = stale.get_guid();
+            drop(stale); // release the handle before removing the device under it
+            if remove_device_instance(stale_guid) {
+                tracing::warn!(
+                    "removed a leftover '{}' adapter from a previous run",
+                    ADAPTER_NAME
+                );
+                // Device removal is not instantaneous, and the name stays taken
+                // until it lands — create too early and Windows hands us
+                // 'tunnel0 2'. Only paid when there was actually an orphan.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            } else {
+                tracing::warn!(
+                    "a leftover '{}' adapter is present and could not be removed; \
+                     the new adapter may come up under a suffixed name",
+                    ADAPTER_NAME
+                );
+            }
+        }
+
+        // Argument order is (name, tunnel_type): friendly name first, description
+        // second. GUID is None on purpose — see the note above the constants.
+        let adapter = wintun::Adapter::create(&wintun, ADAPTER_NAME, ADAPTER_TYPE, None)
+            .with_context(|| format!("failed to create Wintun adapter '{}'", ADAPTER_NAME))?;
+        let guid = adapter.get_guid();
+        let name = adapter.get_name().unwrap_or_else(|_| ADAPTER_NAME.to_string());
+        // Windows suffixes a name that is still claimed by a lingering registry
+        // entry ('tunnel0 2'). Everything downstream — routes, the DNS pin, the
+        // kill switch — keys off `name`, so this is not fatal; but it means the
+        // host has cruft worth knowing about.
+        if name != ADAPTER_NAME {
             tracing::warn!(
-                "removed a leftover '{}' adapter from a previous run",
+                "adapter came up as '{}' rather than '{}' — a previous interface \
+                 is still registered under that name",
+                name,
                 ADAPTER_NAME
             );
         }
-
-        let adapter = wintun::Adapter::create(&wintun, "Tunnel", ADAPTER_NAME, None)
-            .with_context(|| format!("failed to create Wintun adapter '{}'", ADAPTER_NAME))?;
-        let name = adapter.get_name().unwrap_or_else(|_| ADAPTER_NAME.to_string());
 
         // netsh failures are fatal, not ignored: an adapter without its address
         // or MTU produces a session that "runs" and moves nothing, and the
@@ -235,8 +294,41 @@ mod platform {
                 writer: Some(writer),
                 stopping,
                 name,
+                guid,
             },
         })
+    }
+
+    /// The PnP device instance wintun creates for an adapter with GUID `g`.
+    fn device_instance_id(g: u128) -> String {
+        format!(
+            "SWD\\Wintun\\{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+            (g >> 96) as u32,
+            (g >> 80) as u16,
+            (g >> 64) as u16,
+            (g >> 48) as u16,
+            (g & 0xFFFF_FFFF_FFFF) as u64,
+        )
+    }
+
+    /// Remove the device instance for GUID `g`, returning whether anything was
+    /// actually removed.
+    ///
+    /// This is the guarantee that exiting leaves no interface behind.
+    /// `WintunCloseAdapter` removes the adapter only for the process that created
+    /// it, and only if the driver is in a position to oblige — a leaked handle
+    /// clone, a wedged session, or a prior run that never reached its teardown all
+    /// leave the interface installed. Removing the PnP device is unconditional.
+    /// Needs the admin rights the engine already requires.
+    ///
+    /// Failure is the normal case on a clean exit (the adapter is already gone),
+    /// hence the quiet bool rather than an error.
+    fn remove_device_instance(g: u128) -> bool {
+        std::process::Command::new("pnputil")
+            .args(["/remove-device", &device_instance_id(g)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// Run netsh, failing with its own output on a non-zero exit.

@@ -295,8 +295,8 @@ mod platform {
 
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        CancelMibChangeNotify2, GetBestInterfaceEx, NotifyRouteChange2, MIB_IPFORWARD_ROW2,
-        MIB_NOTIFICATION_TYPE,
+        CancelMibChangeNotify2, FreeMibTable, GetBestInterfaceEx, GetIpForwardTable2,
+        NotifyRouteChange2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_NOTIFICATION_TYPE,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN};
 
