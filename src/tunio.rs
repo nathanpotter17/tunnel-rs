@@ -37,8 +37,12 @@ impl TunIo {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use anyhow::Context;
-    use std::path::PathBuf;
+    use anyhow::{bail, Context};
+    // OsStrExt: UTF-16 for the WinTrust call. OpenOptionsExt: the share mode
+    // that keeps the verified bytes from being swapped before they are mapped.
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -152,6 +156,14 @@ mod platform {
         } else {
             "x86"
         };
+        // Anchored to the executable, never to the working directory. This
+        // process always runs elevated, and a DLL resolved through a
+        // CWD-relative path is loaded from wherever the user happened to be
+        // when they started it — a download folder, a share, a removable
+        // drive. Anything that can write there would be executing inside an
+        // elevated process. The install directory is a smaller target than
+        // "any directory the user might cd into", and `verify_signature`
+        // below covers what remains of it.
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -160,17 +172,180 @@ mod platform {
                 candidates.push(dir.join("bin").join(arch).join("wintun.dll"));
             }
         }
-        candidates.push(PathBuf::from(format!("bin/{}/wintun.dll", arch)));
-        candidates.push(PathBuf::from("wintun.dll"));
         candidates.into_iter().find(|p| p.exists())
+    }
+
+    /// The publisher the shipped `wintun.dll` is signed by.
+    ///
+    /// Pinned, because "carries a valid Authenticode signature" is not by
+    /// itself a check — a certificate is something an attacker can obtain and
+    /// sign their own payload with. The question worth asking is not whether
+    /// the file is signed but whether it is signed by *them*.
+    const WINTUN_SIGNER: &str = "WireGuard LLC";
+
+    /// Deny writers for as long as we hold the file.
+    ///
+    /// The gap between "the signature checked out" and "LoadLibrary read the
+    /// bytes" is a race, and against an attacker who can rewrite the file it is
+    /// a race they can simply retry until they win. Holding one handle across
+    /// both — verifying *through* it, then loading while it is still open —
+    /// means the bytes that were checked are the bytes that get mapped.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+    /// Verify `path` carries a valid Authenticode signature from
+    /// [`WINTUN_SIGNER`], reading the signer off the very chain WinVerifyTrust
+    /// validated rather than parsing the file a second time.
+    pub(super) fn verify_signature(path: &Path, file: &std::fs::File) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Security::WinTrust::{
+            WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+            WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_SAFER_FLAG,
+            WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        };
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut file_info: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
+        file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+        file_info.pcwszFilePath = wide.as_ptr();
+        file_info.hFile = file.as_raw_handle() as HANDLE;
+
+        let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
+        data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+        data.dwUIChoice = WTD_UI_NONE;
+        // No online revocation check. This process rewrites the host's routing
+        // and resolver, and arms a kill switch that drops unmarked traffic —
+        // so a CRL fetch here can hang or fail for reasons that have nothing to
+        // do with the file, including reasons we caused. Chain validity plus
+        // the pinned subject below is the check that is actually being made.
+        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.dwUnionChoice = WTD_CHOICE_FILE;
+        data.Anonymous = WINTRUST_DATA_0 { pFile: &mut file_info };
+        data.dwStateAction = WTD_STATEACTION_VERIFY;
+        data.dwProvFlags = WTD_SAFER_FLAG;
+
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let pdata = &mut data as *mut WINTRUST_DATA as *mut std::ffi::c_void;
+        let status = unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, pdata) };
+
+        // Read the signer before the state handle is closed — it owns the chain.
+        let signer = if status == 0 { unsafe { signer_name(data.hWVTStateData) } } else { None };
+
+        // Always release the provider state, whatever the verdict. The pointer
+        // is retaken rather than reusing `pdata`: liveness analysis does not
+        // follow raw pointers, so assigning through the binding and passing a
+        // pointer made earlier reads as a dead store.
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let pclose = &mut data as *mut WINTRUST_DATA as *mut std::ffi::c_void;
+        unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, pclose) };
+
+        if status != 0 {
+            bail!(
+                "{} failed Authenticode verification (0x{:08X}).\n\
+                 This file is loaded into a process running with administrator \
+                 rights, so an unverifiable copy is refused rather than trusted. \
+                 Replace it with the signed release from https://www.wintun.net/",
+                path.display(),
+                status as u32
+            );
+        }
+        match signer.as_deref() {
+            Some(WINTUN_SIGNER) => Ok(()),
+            Some(other) => bail!(
+                "{} is signed by {:?}, not {:?}.\n\
+                 A valid signature from the wrong publisher is what a substituted \
+                 DLL looks like. Replace it with the signed release from \
+                 https://www.wintun.net/",
+                path.display(),
+                other,
+                WINTUN_SIGNER
+            ),
+            None => bail!(
+                "{} verified, but its signer could not be read — refusing to load it",
+                path.display()
+            ),
+        }
+    }
+
+    /// Leaf-certificate subject of the first signer on a verified chain.
+    ///
+    /// # Safety
+    /// `state` must be the `hWVTStateData` of a WinVerifyTrust call that
+    /// returned success and has not yet been closed.
+    unsafe fn signer_name(state: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+        use windows_sys::Win32::Security::Cryptography::{
+            CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        };
+        use windows_sys::Win32::Security::WinTrust::{
+            WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+            WTHelperProvDataFromStateData,
+        };
+
+        let prov = WTHelperProvDataFromStateData(state);
+        if prov.is_null() {
+            return None;
+        }
+        let sgnr = WTHelperGetProvSignerFromChain(prov, 0, 0, 0);
+        if sgnr.is_null() {
+            return None;
+        }
+        // Index 0 is the leaf: the certificate that actually signed the file.
+        let cert = WTHelperGetProvCertFromChain(sgnr, 0);
+        if cert.is_null() || (*cert).pCert.is_null() {
+            return None;
+        }
+        let ctx = (*cert).pCert;
+
+        let len = CertGetNameStringW(
+            ctx,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if len <= 1 {
+            return None; // 1 == the terminating NUL alone, i.e. no name
+        }
+        let mut buf = vec![0u16; len as usize];
+        let got = CertGetNameStringW(
+            ctx,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            std::ptr::null(),
+            buf.as_mut_ptr(),
+            len,
+        );
+        if got == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..got as usize - 1]))
     }
 
     pub fn create(ip: std::net::Ipv4Addr, prefix: u8, mtu: u16) -> Result<TunIo> {
         let dll = locate_wintun_dll().context(
             "wintun.dll not found; place the arch-matching DLL next to the exe or in bin/<arch>/",
         )?;
+
+        // Open once, deny writers, verify through that handle, and keep it open
+        // across the load. Under the shipped layout the DLL sits in a directory
+        // the user can write to, which means anything running as the user can
+        // rewrite it and wait for the next elevated launch — so the signature is
+        // checked, and checked on the bytes that actually get mapped.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&dll)
+            .with_context(|| format!("could not open {} for verification", dll.display()))?;
+        verify_signature(&dll, &file)?;
         let wintun = unsafe { wintun::load_from_path(&dll) }
             .with_context(|| format!("failed to load wintun dll from {}", dll.display()))?;
+        drop(file);
+        tracing::debug!("wintun.dll verified: signed by {}", WINTUN_SIGNER);
 
         // Startup reclamation: a clean shutdown removes the adapter, so a leftover
         // means a prior run was hard-killed (or tripped the tripwire lockdown,
@@ -490,3 +665,62 @@ pub use platform::KeepAlive;
 
 #[cfg(windows)]
 pub use platform::locate_wintun_dll;
+
+#[cfg(all(windows, test))]
+mod tests {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// The DLL this repo ships must pass the check the engine makes of it.
+    ///
+    /// Worth a test because the two halves fail in opposite directions and
+    /// neither is visible from the other: too strict and every launch is
+    /// refused, too loose and the check is theatre. It also proves the deny-
+    /// write share mode does not stop `LoadLibrary` — verifying and then
+    /// loading through one handle is the part that closes the swap window, and
+    /// it would be a poor way to discover a sharing violation.
+    #[test]
+    fn the_wintun_we_ship_is_signed_by_who_we_expect_and_still_loads() {
+        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+        let dll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("bin")
+            .join(arch)
+            .join("wintun.dll");
+        if !dll.exists() {
+            eprintln!("skipping: {} not present", dll.display());
+            return;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001) // FILE_SHARE_READ
+            .open(&dll)
+            .expect("open the shipped dll");
+        super::platform::verify_signature(&dll, &file).expect("shipped wintun.dll must verify");
+
+        // Still loadable while that handle is held open.
+        unsafe { wintun::load_from_path(&dll) }.expect("verified dll must still load");
+        drop(file);
+    }
+
+    /// An unsigned file must be refused, not merely noted.
+    #[test]
+    fn an_unsigned_dll_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tunnel-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("wintun.dll");
+        // Any unsigned bytes will do: the check runs before the loader does.
+        std::fs::write(&fake, b"MZ not a real dll").unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&fake)
+            .unwrap();
+        assert!(
+            super::platform::verify_signature(&fake, &file).is_err(),
+            "an unsigned file must not pass verification"
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

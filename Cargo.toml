@@ -50,6 +50,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
+    # Authenticode verification of wintun.dll before it is loaded (tunio.rs).
+    # WinTrust validates the chain; Cryptography reads the signer's name off it.
+    # The WTHelper* accessors that walk the verified chain (ProvDataFromStateData,
+    # GetProvSignerFromChain) sit behind Catalog + Sip in windows-sys 0.59 — the
+    # neighbouring GetProvCertFromChain does not, so omitting these two fails as
+    # two missing imports rather than as a missing feature.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
 ] }
 windows = { version = "0.59", features = [
     "Win32_Foundation",

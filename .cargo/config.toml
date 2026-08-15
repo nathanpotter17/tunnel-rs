@@ -1,0 +1,37 @@
+# Ship builds link the CRT statically.
+#
+# The engine always runs elevated, and it ships as a portable folder the user
+# drops wherever they like. A dynamically-linked vcruntime140.dll is resolved
+# from the executable's own directory BEFORE System32 -- that is the documented
+# search order, and SafeDllSearchMode does not change it (it demotes the CWD,
+# never the app directory). So on a user-writable install path, anyone who can
+# write there can plant a vcruntime140.dll and execute code inside an elevated
+# process. Static linking removes that vector.
+#
+# The cost is servicing: the statically-linked CRT no longer receives Windows
+# Update / redistributable fixes, so a CRT advisory means rebuilding and
+# re-shipping. That is an acceptable trade here -- Rust's std reaches Win32
+# directly for I/O, threading and allocation, so the C library surface this
+# binary actually exercises is thin, and the components that parse hostile
+# input (boringtun, smoltcp, inspect.rs, probe.rs) were never serviced by
+# anyone but us regardless.
+#
+# `build.target` is set so a bare `cargo build --release` produces the shippable
+# binary at ONE predictable path, rather than leaving a dynamically-linked
+# lookalike at target/release/tunnel.exe for someone to ship by mistake.
+#
+#   ship binary: target/x86_64-pc-windows-msvc/release/tunnel.exe
+#
+# To opt out for a one-off build:  cargo build --release --target <other-triple>
+# To revert entirely: delete this file.
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# ARM64 ship builds: cargo build --release --target aarch64-pc-windows-msvc
+# (pair with bin/arm64/wintun.dll).
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
