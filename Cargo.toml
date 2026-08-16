@@ -3,7 +3,6 @@ name = "tunnel"
 version = "0.1.0"
 edition = "2021"
 description = "Software-defined egress engine with traffic observability"
-license = "BSD"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -18,24 +17,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 smoltcp = { version = "0.12", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation",
-    "socket-tcp", "socket-udp",
-    # Socket wakers. This is what makes dispatch readiness-driven instead of a
-    # full-table scan per wake (see conn.rs) — smoltcp only compiles
-    # register_recv_waker / register_send_waker under this feature.
-    "async",
+    "socket-tcp", "socket-udp", "async",
 ] }
 
-# GUI (optional, enabled by default). No file dialogs remain, so rfd/open are
-# gone with the file channel — the dashboard is display-only.
 eframe = { version = "0.29", optional = true }
 
 [features]
 default = ["gui"]
 gui = ["eframe"]
-
-# ============================================================================
-# Platform-specific TUN dependencies
-# ============================================================================
 
 [target.'cfg(unix)'.dependencies]
 tun = { version = "0.6", features = ["async"] }
@@ -50,12 +39,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
-    # Authenticode verification of wintun.dll before it is loaded (tunio.rs).
-    # WinTrust validates the chain; Cryptography reads the signer's name off it.
-    # The WTHelper* accessors that walk the verified chain (ProvDataFromStateData,
-    # GetProvSignerFromChain) sit behind Catalog + Sip in windows-sys 0.59 — the
-    # neighbouring GetProvCertFromChain does not, so omitting these two fails as
-    # two missing imports rather than as a missing feature.
     "Win32_Security_WinTrust",
     "Win32_Security_Cryptography",
     "Win32_Security_Cryptography_Catalog",
@@ -69,5 +52,9 @@ windows = { version = "0.59", features = [
 ] }
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = true
+

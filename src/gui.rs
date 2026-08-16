@@ -744,7 +744,7 @@ impl TunnelApp {
         };
 
         eframe::run_native(
-            concat!("Quorum IO — tunnel ", env!("CARGO_PKG_VERSION")),
+            concat!("Tunnel-RS ", env!("CARGO_PKG_VERSION")),
             options,
             Box::new(move |_cc| Ok(Box::new(TunnelApp::new(shared)))),
         )
@@ -950,8 +950,9 @@ fn v_seam(ui: &mut egui::Ui, height: f32, id: impl std::hash::Hash, theme: &Them
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
     let color = if live { theme.accent_hover } else { theme.border };
+    let x = snap(ui, rect.center().x);
     ui.painter()
-        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0, color));
+        .vline(x, rect.y_range(), Stroke::new(1.0, color));
     resp.drag_delta().x
 }
 
@@ -965,8 +966,9 @@ fn h_seam(ui: &mut egui::Ui, id: impl std::hash::Hash, theme: &Theme) -> f32 {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
     if live {
+        let y = snap(ui, rect.center().y);
         ui.painter()
-            .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, theme.accent_hover));
+            .hline(rect.x_range(), y, Stroke::new(1.0, theme.accent_hover));
     }
     resp.drag_delta().y
 }
@@ -1039,8 +1041,9 @@ fn render_panel(
                     );
 
                     let rule = ui.available_rect_before_wrap();
+                    let rule_y = snap(ui, rule.top());
                     ui.painter()
-                        .hline(rule.x_range(), rule.top(), Stroke::new(1.0, theme.border));
+                        .hline(rule.x_range(), rule_y, Stroke::new(1.0, theme.border));
 
                     let content_h = (height - HEADER_H - 2.0 * PAD_Y).max(0.0);
                     egui::Frame::none()
@@ -1091,7 +1094,7 @@ fn view_selector(ui: &mut egui::Ui, wid: u64, kind: &mut View, theme: &Theme) {
 
 fn render_header(ui: &mut egui::Ui, status: &Status, traffic: &TrafficSnapshot, theme: &Theme) {
     ui.horizontal(|ui| {
-        ui.label(mono("QUORUM IO", 13.0).color(theme.text_primary).strong());
+        ui.label(mono("Tunnel-RS", 13.0).color(theme.text_primary).strong());
 
         ui.add_space(GAP * 2.0);
 
@@ -1227,7 +1230,7 @@ fn draw_chart(ui: &mut egui::Ui, traffic: &TrafficSnapshot, theme: &Theme) {
         .fold(1.0_f64, f64::max);
 
     for frac in [0.25_f32, 0.5, 0.75] {
-        let y = rect.bottom() - frac * (rect.height() - 4.0) - 2.0;
+        let y = snap(ui, rect.bottom() - frac * (rect.height() - 4.0) - 2.0);
         painter.hline(rect.x_range(), y, Stroke::new(1.0, with_alpha(theme.border, 90)));
     }
 
@@ -1237,25 +1240,42 @@ fn draw_chart(ui: &mut egui::Ui, traffic: &TrafficSnapshot, theme: &Theme) {
         }
         let n = series.len();
         let dx = rect.width() / (n - 1) as f32;
-        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(n);
-        for (i, v) in series.iter().enumerate() {
-            let x = rect.left() + dx * i as f32;
-            let y = rect.bottom() - (v / max) as f32 * (rect.height() - 4.0) - 2.0;
-            pts.push(egui::pos2(x, y));
-        }
+        let pts: Vec<egui::Pos2> = series
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let x = rect.left() + dx * i as f32;
+                let y = rect.bottom() - (v / max) as f32 * (rect.height() - 4.0) - 2.0;
+                egui::pos2(x, y)
+            })
+            .collect();
+
+        // The area under the trace, as one mesh: a quad per sample interval,
+        // its top edge the trace itself. Filling it with a translucent bar per
+        // sample instead put a feathered edge every few pixels, and a hundred
+        // of those printed a comb of vertical stripes across the whole chart —
+        // and the bars were flat-topped, so the fill and the line they were
+        // meant to sit under disagreed wherever the rate was moving.
         if fill {
-            for (i, p) in pts.iter().enumerate() {
-                let x0 = rect.left() + dx * i as f32;
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(x0, p.y),
-                    egui::pos2((x0 + dx).min(rect.right()), rect.bottom()),
+            let mut mesh = egui::Mesh::default();
+            let tint = with_alpha(color, 40);
+            for w in pts.windows(2) {
+                let floor = rect.bottom();
+                mesh_quad(
+                    &mut mesh,
+                    w[0],
+                    w[1],
+                    egui::pos2(w[1].x, floor),
+                    egui::pos2(w[0].x, floor),
+                    tint,
                 );
-                painter.rect_filled(bar, Rounding::ZERO, with_alpha(color, 40));
             }
+            painter.add(egui::Shape::mesh(mesh));
         }
-        for w in pts.windows(2) {
-            painter.line_segment([w[0], w[1]], Stroke::new(1.5, color));
-        }
+        // One path, not a segment per sample. Segments drawn one at a time are
+        // each feathered to their own ends, so every joint is a double-painted
+        // bead and a 1.5px trace reads as a string of them.
+        painter.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
     };
 
     plot(&traffic.down_series, theme.accent, true);
@@ -1335,10 +1355,11 @@ fn flows_pane(
             selected,
             62.0,
         );
-        ui.checkbox(&mut state.hide_idle, "");
-        if wide {
-            ui.label(mono("live only", 9.0).color(theme.text_muted));
-        }
+        // The caption is the checkbox's own label, not a neighbouring one, so
+        // the words are part of the click target instead of a 12px box being
+        // the only way to hit it. Dropped when narrow, as before.
+        let live_label = if wide { "live only" } else { "" };
+        ui.checkbox(&mut state.hide_idle, mono(live_label, 9.0).color(theme.text_muted));
     });
     ui.add_space(ROW_GAP);
 
@@ -1895,62 +1916,55 @@ fn proto_legend(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, total: u
         });
 }
 
-/// Donut: a base disc in the dominant protocol's colour, the remaining sectors
-/// painted over it, then the centre punched out.
+/// Donut: one mesh, walked once around the ring.
 ///
-/// Two details matter for how it reads. First, each sector is ONE polygon, not a
-/// fan of triangles — every triangle in a fan is antialiased against what is
-/// behind it, so a fan draws a hundred visible spokes across a solid slice. A
-/// sector stays convex up to half a turn, so `convex_polygon` is valid as long as
-/// wide slices are split; splitting at 120 degrees bounds that at two internal
-/// seams. Second, the largest slice is drawn as a full circle underneath
-/// everything else, which removes its seams entirely — and the largest slice is
-/// exactly the one where they would show.
+/// The ring is emitted as a strip of quads and nothing is ever painted on top of
+/// anything else, which is the whole point. Painting sectors as separate shapes
+/// cannot avoid seams: egui antialiases each shape by feathering its outline, so
+/// two shapes sharing an edge each fade out across it and whatever is behind
+/// them shows through as a hairline. Inside one mesh, neighbouring quads share
+/// an exact edge and the rasteriser closes it — so a slice may start and end
+/// anywhere, at any width, with no seam and no ordering rules.
+///
+/// Antialiasing is then done by the mesh itself: [`ring_band`] fades the inner
+/// and outer rims to transparent, which also means the hole is a real hole
+/// rather than a disc in the panel colour painted back over the middle.
 fn draw_donut(ui: &mut egui::Ui, traffic: &TrafficSnapshot, total: u64, dia: f32, theme: &Theme) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(dia, dia), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let c = rect.center();
-    let r = dia * 0.5 - 2.0;
-    if r <= 6.0 || total == 0 {
+    let r_out = dia * 0.5 - 2.0;
+    if r_out <= 6.0 || total == 0 {
         return;
     }
+    let r_in = r_out * 0.58;
+    // One physical pixel, which is what egui feathers its own shapes by. Fixing
+    // it in points instead would blur the rims at the 125% and 150% desktop
+    // scales, where a point is not a pixel. Capped at half the ring so the two
+    // fades cannot cross over each other on a small donut.
+    let rim = (1.0 / ui.ctx().pixels_per_point()).min((r_out - r_in) * 0.5);
 
-    // `apps` arrives sorted by bytes descending, so the first live entry is the
-    // dominant one.
-    let live: Vec<&crate::inspect::AppRow> =
-        traffic.apps.iter().filter(|a| a.bytes > 0).collect();
-    let Some(first) = live.first() else {
-        return;
-    };
+    let mut mesh = egui::Mesh::default();
+    // Angles come from a running byte total rather than from accumulated
+    // sweeps, so the last slice ends on exactly one turn and the ring closes.
+    let start = -std::f32::consts::FRAC_PI_2;
+    let angle_at = |bytes: u64| start + bytes as f32 / total as f32 * std::f32::consts::TAU;
+    let mut done: u64 = 0;
 
-    painter.circle_filled(c, r, proto_color(first.name, theme));
-
-    let sweep_of = |bytes: u64| bytes as f32 / total as f32 * std::f32::consts::TAU;
-    let mut angle = -std::f32::consts::FRAC_PI_2 + sweep_of(first.bytes);
-
-    for a in live.iter().skip(1) {
-        let sweep = sweep_of(a.bytes);
+    for a in traffic.apps.iter().filter(|a| a.bytes > 0) {
+        let (a0, a1) = (angle_at(done), angle_at(done + a.bytes));
         let color = proto_color(a.name, theme);
-        const MAX_CHUNK: f32 = 2.0944; // 120 degrees: safely convex
-        let chunks = ((sweep / MAX_CHUNK).ceil() as usize).max(1);
-        let chunk = sweep / chunks as f32;
-        for k in 0..chunks {
-            let start = angle + chunk * k as f32;
-            // One arc point per ~3 degrees, minimum two so a hairline slice is
-            // still a wedge rather than a line.
-            let steps = ((chunk / 0.052).ceil() as usize).max(2);
-            let mut pts: Vec<egui::Pos2> = Vec::with_capacity(steps + 2);
-            pts.push(c);
-            for i in 0..=steps {
-                let t = start + chunk * (i as f32 / steps as f32);
-                pts.push(c + Vec2::new(t.cos() * r, t.sin() * r));
-            }
-            painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+        // One quad per ~3 degrees, so the rim reads as a curve; at least one, so
+        // a slice too thin to subdivide is still drawn.
+        let bands = (((a1 - a0) / 0.052).ceil() as usize).max(1);
+        for k in 0..bands {
+            let lerp = |i: usize| a0 + (a1 - a0) * (i as f32 / bands as f32);
+            ring_band(&mut mesh, c, r_in, r_out, rim, lerp(k), lerp(k + 1), color);
         }
-        angle += sweep;
+        done += a.bytes;
     }
 
-    painter.circle_filled(c, r * 0.58, theme.surface);
+    painter.add(egui::Shape::mesh(mesh));
     painter.text(
         c,
         egui::Align2::CENTER_CENTER,
@@ -1958,6 +1972,43 @@ fn draw_donut(ui: &mut egui::Ui, traffic: &TrafficSnapshot, total: u64, dia: f32
         egui::FontId::monospace(MONO_PT),
         theme.text_primary,
     );
+}
+
+/// Append one flat-coloured quad of the ring, spanning `a0` to `a1`.
+///
+/// Four radii per edge, not two: the innermost and outermost are the same colour
+/// at zero alpha, so the rims fade over `rim` instead of stepping. The fade is
+/// part of the geometry, which is what keeps the band free of an antialiased
+/// outline of its own — see [`draw_donut`].
+#[allow(clippy::too_many_arguments)]
+fn ring_band(
+    mesh: &mut egui::Mesh,
+    c: egui::Pos2,
+    r_in: f32,
+    r_out: f32,
+    rim: f32,
+    a0: f32,
+    a1: f32,
+    color: Color32,
+) {
+    let stops = [
+        (r_in, Color32::TRANSPARENT),
+        (r_in + rim, color),
+        (r_out - rim, color),
+        (r_out, Color32::TRANSPARENT),
+    ];
+    let base = mesh.vertices.len() as u32;
+    for angle in [a0, a1] {
+        let (sin, cos) = angle.sin_cos();
+        for (r, col) in stops {
+            mesh.colored_vertex(c + Vec2::new(cos * r, sin * r), col);
+        }
+    }
+    // Three quads stacked across the band: fade in, body, fade out.
+    for k in 0..3 {
+        mesh.add_triangle(base + k, base + k + 1, base + 4 + k);
+        mesh.add_triangle(base + k + 1, base + 5 + k, base + 4 + k);
+    }
 }
 
 /// Unique remote hosts: every conversation with one address on one row.
@@ -2024,15 +2075,30 @@ fn render_composition(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, th
     let (bar, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 13.0), egui::Sense::hover());
     let painter = ui.painter_at(bar);
-    painter.rect_filled(bar, Rounding::same(2.0), theme.surface_hover);
-    let mut x = bar.left();
+    // Square, like the per-protocol tracks below it. Rounded, the stack's own
+    // square ends sat proud of the track's corners.
+    painter.rect_filled(bar, Rounding::ZERO, theme.surface_hover);
+
+    // Same two rules as the donut, for the same two reasons: edges come from a
+    // running byte total so the last segment lands exactly on the right edge
+    // rather than wherever the accumulated widths drifted to, and the segments
+    // go in one mesh so no seam between them can show the track behind.
+    let mut mesh = egui::Mesh::default();
+    let x_at = |bytes: u64| bar.left() + bytes as f32 / total as f32 * bar.width();
+    let mut done: u64 = 0;
     for a in traffic.apps.iter().filter(|a| a.bytes > 0) {
-        let seg_w = a.bytes as f32 / total as f32 * bar.width();
-        let seg =
-            egui::Rect::from_min_size(egui::pos2(x, bar.top()), Vec2::new(seg_w, bar.height()));
-        painter.rect_filled(seg, Rounding::ZERO, proto_color(a.name, theme));
-        x += seg_w;
+        let (x0, x1) = (x_at(done), x_at(done + a.bytes));
+        mesh_quad(
+            &mut mesh,
+            egui::pos2(x0, bar.top()),
+            egui::pos2(x1, bar.top()),
+            egui::pos2(x1, bar.bottom()),
+            egui::pos2(x0, bar.bottom()),
+            proto_color(a.name, theme),
+        );
+        done += a.bytes;
     }
+    painter.add(egui::Shape::mesh(mesh));
 
     ui.add_space(GAP);
 
@@ -2136,8 +2202,9 @@ fn render_counters(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, theme
 fn header_rule(ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(ROW_GAP);
     let rect = ui.available_rect_before_wrap();
+    let y = snap(ui, rect.top());
     ui.painter()
-        .hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme.border));
+        .hline(rect.x_range(), y, Stroke::new(1.0, theme.border));
     ui.add_space(ROW_GAP);
 }
 
@@ -2208,6 +2275,41 @@ fn proto_color(app: &str, theme: &Theme) -> Color32 {
 
 fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// Append one flat-coloured quad, corners in order around the edge.
+///
+/// The reason anything in this file builds a mesh by hand is that quads in one
+/// mesh share their edges exactly, so neighbours butt together with nothing
+/// between them. Drawn as separate shapes they would each be feathered, and two
+/// feathered edges over each other print a hairline of whatever is behind —
+/// see [`draw_donut`], where that artefact is at its most visible.
+fn mesh_quad(
+    mesh: &mut egui::Mesh,
+    a: egui::Pos2,
+    b: egui::Pos2,
+    c: egui::Pos2,
+    d: egui::Pos2,
+    color: Color32,
+) {
+    let base = mesh.vertices.len() as u32;
+    for p in [a, b, c, d] {
+        mesh.colored_vertex(p, color);
+    }
+    mesh.add_triangle(base, base + 1, base + 2);
+    mesh.add_triangle(base, base + 2, base + 3);
+}
+
+/// Put a hairline on the pixel grid.
+///
+/// A 1px stroke at a fractional coordinate is spread across two rows of pixels
+/// at partial coverage each, so it draws as a soft grey band instead of a rule.
+/// egui hands out fractional coordinates all the time — a stretched row height
+/// divided among bands rarely lands on an integer — and this window is mostly
+/// rules, so they are worth snapping to a pixel centre.
+fn snap(ui: &egui::Ui, v: f32) -> f32 {
+    let ppp = ui.ctx().pixels_per_point();
+    ((v * ppp).round() + 0.5) / ppp
 }
 
 /// A monospace text entry whose OUTER width is exactly `width`, so a row of
@@ -2791,7 +2893,7 @@ mod tests {
             text.push_str(r.label());
         }
         for s in [
-            "QUORUM IO", "[ON]", "[OFF]", "[ERR]", "CONNECTED", "ENGINE STOPPED", "OFFLINE",
+            "Tunnel-RS", "[ON]", "[OFF]", "[ERR]", "CONNECTED", "ENGINE STOPPED", "OFFLINE",
             "FWD IDLE ERR REQ",
             // Protocol labels reach the screen from inspect.rs, so they belong
             // in this registry too — `uTP` is one keystroke from `µTP`.
