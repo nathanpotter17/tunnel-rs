@@ -1,6 +1,6 @@
 //! Traffic inspection for observability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,9 @@ const MAX_PORTS: usize = 64;
 /// a long, churny session can't grow the archive without bound; the dropped
 /// count is reported once at shutdown.
 const MAX_ARCHIVE: usize = 65_536;
+
+/// Cap on remote hosts remembered as uTP/DHT speakers (see `Inner::bt_hosts`).
+const MAX_BT_HOSTS: usize = 65_536;
 
 /// Packet direction relative to the local host.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,6 +86,11 @@ pub enum AppProto {
     OpenVpn,
     Shadowsocks,
     Obfuscated,
+    /// `Obfuscated`, to a host that also carries uTP or DHT — the shape of a
+    /// BitTorrent peer with Message Stream Encryption, whose ciphertext has no
+    /// signature of its own. Set by cross-referencing flows in the monitor,
+    /// never by the per-packet classifier.
+    ObfuscatedBt,
     /// Peer wire protocol over TCP (BEP 3).
     BitTorrent,
     /// Micro Transport Protocol (BEP 29) — BitTorrent's UDP transport, and the
@@ -122,6 +130,7 @@ impl AppProto {
             AppProto::OpenVpn => "OpenVPN",
             AppProto::Shadowsocks => "Shadowsocks",
             AppProto::Obfuscated => "Obfuscated",
+            AppProto::ObfuscatedBt => "Obfuscated (uTP/DHT)",
             AppProto::BitTorrent => "BitTorrent",
             AppProto::Utp => "uTP",
             AppProto::Dht => "DHT",
@@ -143,7 +152,9 @@ impl AppProto {
     fn rank(self) -> u8 {
         match self {
             AppProto::Other => 0,
-            AppProto::Obfuscated => 1,
+            // Equal so a later random packet can neither downgrade the host
+            // relabel nor re-trigger it; a real signature still beats both.
+            AppProto::Obfuscated | AppProto::ObfuscatedBt => 1,
             // Port-derived and L4-derived labels.
             AppProto::Dns
             | AppProto::Mdns
@@ -391,6 +402,12 @@ fn classify(l4: L4, sport: u16, dport: u16, payload: &[u8]) -> AppProto {
         if is_bittorrent(payload) {
             return AppProto::BitTorrent;
         }
+        // HTTP trackers conventionally listen on 6969, 2710 or 1337 — none a
+        // port rule knows — and on 80 they would otherwise read as plain HTTP.
+        // (An HTTPS tracker is TLS like everything else on 443.)
+        if is_http_tracker(payload) {
+            return AppProto::BtTracker;
+        }
     }
 
     // Well-known ports. 53 before 5353 so unicast DNS keeps its label.
@@ -438,8 +455,9 @@ fn classify(l4: L4, sport: u16, dport: u16, payload: &[u8]) -> AppProto {
     }
 
     // Fallback: an unknown port carrying high-entropy TCP/UDP payload is a
-    // strong hint of an obfuscated/encrypted proxy (Shadowsocks, VMess, etc.).
-    if matches!(l4, L4::Tcp | L4::Udp) && payload.len() >= 32 && entropy(payload) > 7.5 {
+    // strong hint of an obfuscated/encrypted proxy (Shadowsocks, VMess, a
+    // BitTorrent peer with Message Stream Encryption, etc.).
+    if matches!(l4, L4::Tcp | L4::Udp) && looks_random(payload) {
         return AppProto::Obfuscated;
     }
 
@@ -482,9 +500,39 @@ fn is_tls(p: &[u8]) -> bool {
 /// that many characters of the protocol name. Nothing to tune and no false
 /// positive to weigh — but it only catches UNENCRYPTED peer connections. A
 /// client with Message Stream Encryption on opens with a Diffie-Hellman key,
-/// which is random by construction and lands in `Obfuscated`, as it should.
+/// which is random by construction and lands in `Obfuscated` via
+/// `looks_random` — that is the label most of today's swarm peers get.
 fn is_bittorrent(p: &[u8]) -> bool {
     p.len() >= 20 && p[0] == 19 && &p[1..20] == b"BitTorrent protocol"
+}
+
+/// HTTP tracker request (BEP 3): a GET whose path ends in `announce` or
+/// `scrape` — `/announce`, `/announce.php`, `/<passkey>/announce`. Only the
+/// request line is examined, so a page that merely mentions the word does not
+/// match, and the scan is bounded by the first line break.
+fn is_http_tracker(p: &[u8]) -> bool {
+    let Some(rest) = p.strip_prefix(b"GET /") else {
+        return false;
+    };
+    // Request line: path up to the space before "HTTP/1.x". Bound the scan so
+    // a huge first segment cannot make this walk the whole payload.
+    let line = &rest[..rest.len().min(512)];
+    let Some(end) = line.iter().position(|&b| b == b' ' || b == b'\r' || b == b'\n') else {
+        return false;
+    };
+    let path = &line[..end];
+    // Path without the query string.
+    let path = match path.iter().position(|&b| b == b'?') {
+        Some(q) => &path[..q],
+        None => path,
+    };
+    let last = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    // Exactly the verb, or the verb with a script extension (announce.php).
+    let verb = match last.iter().position(|&b| b == b'.') {
+        Some(dot) => &last[..dot],
+        None => last,
+    };
+    verb == b"announce" || verb == b"scrape"
 }
 
 /// uTP (BEP 29): 20-byte header, low nibble of byte 0 the version (always 1),
@@ -536,6 +584,37 @@ fn is_dht(p: &[u8]) -> bool {
 fn is_bt_tracker(p: &[u8]) -> bool {
     const MAGIC: [u8; 8] = [0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80];
     p.len() >= 16 && p[..8] == MAGIC && p[8..12] == [0, 0, 0, 0]
+}
+
+/// Does this payload look like ciphertext or random padding?
+///
+/// Entropy is measured over at most 256 bytes, and a sample that small can
+/// never approach 8 bits/byte even when it IS uniformly random: with 256
+/// draws from 256 symbols the birthday collisions cap it around 7.2, and at
+/// 96 draws around 6.2 (log2 of the sample size is the absolute ceiling). A
+/// single fixed bar therefore has to move with the sample size, and it is set
+/// a few tenths below the lowest entropy genuinely random data produces at
+/// that size. Text, bencode, HTTP and other structured payloads top out near
+/// 5.1 regardless of length, so the band between is wide.
+///
+/// The minimum of 96 bytes is the length of an MSE handshake opener (a 96-byte
+/// Diffie-Hellman key, before padding), the shortest random-looking first
+/// packet worth labelling. Anything shorter is left to a later packet: the
+/// flow label is upgrade-only, so one full-size ciphertext packet fixes it.
+fn looks_random(p: &[u8]) -> bool {
+    let n = p.len().min(256);
+    if n < 96 {
+        return false;
+    }
+    // Floor of observed random-data entropy at each size (4000-trial
+    // simulation): 96 → 5.9, 128 → 6.3, 192 → 6.7, 256 → 7.0.
+    let bar = match n {
+        0..=127 => 5.5,
+        128..=191 => 6.0,
+        192..=255 => 6.4,
+        _ => 6.8,
+    };
+    entropy(p) > bar
 }
 
 /// Shannon entropy in bits/byte over the first 256 bytes.
@@ -616,6 +695,18 @@ fn record_of(k: &FlowKey, f: &Flow, wall_base: SystemTime, mono_base: Instant) -
     }
 }
 
+/// Change a flow's label and move its previously counted bytes with it, so the
+/// per-protocol totals track the flow's final identity, not its first packet.
+fn relabel(flow: &mut Flow, proto_bytes: &mut HashMap<&'static str, u64>, app: AppProto) {
+    let hist = flow.up + flow.down;
+    if hist > 0 {
+        let old = proto_bytes.entry(flow.app.label()).or_insert(0);
+        *old = old.saturating_sub(hist);
+        *proto_bytes.entry(app.label()).or_insert(0) += hist;
+    }
+    flow.app = app;
+}
+
 struct Inner {
     total_up: u64,
     total_down: u64,
@@ -633,6 +724,11 @@ struct Inner {
     /// the CSV's incompleteness is stated, not silent.
     archive_dropped: u64,
     proto_bytes: HashMap<&'static str, u64>,
+    /// Remote hosts seen speaking uTP or DHT this session. An `Obfuscated` TCP
+    /// flow to one of them is almost certainly an encrypted BitTorrent peer, so
+    /// it is relabelled `ObfuscatedBt`. Bounded: a large swarm is thousands of
+    /// hosts, and past the cap the relabel simply stops learning new ones.
+    bt_hosts: HashSet<IpAddr>,
     last_tick: Instant,
     /// Clock base pair for converting monotonic stamps to wall time at export.
     wall_base: SystemTime,
@@ -654,6 +750,7 @@ impl Inner {
             archive: VecDeque::new(),
             archive_dropped: 0,
             proto_bytes: HashMap::new(),
+            bt_hosts: HashSet::new(),
             last_tick: now,
             wall_base: SystemTime::now(),
             mono_base: now,
@@ -739,8 +836,15 @@ impl TrafficMonitor {
         // Split borrows: the flow entry and the per-protocol counters are
         // updated as one unit so they can never disagree.
         let Inner {
-            flows, proto_bytes, ..
+            flows,
+            proto_bytes,
+            bt_hosts,
+            ..
         } = &mut *inner;
+
+        if matches!(parsed.app, AppProto::Utp | AppProto::Dht) && bt_hosts.len() < MAX_BT_HOSTS {
+            bt_hosts.insert(remote_ip);
+        }
 
         // Bound live per-flow tracking against unbounded flow creation (the same
         // adversarial input conn.rs budgets for). The packet is already in the
@@ -769,13 +873,12 @@ impl TrafficMonitor {
         // reattribute the flow's previously counted bytes so per-protocol
         // totals track the flow's final identity, not its first packet.
         if parsed.app.rank() > flow.app.rank() {
-            let hist = flow.up + flow.down;
-            if hist > 0 {
-                let old = proto_bytes.entry(flow.app.label()).or_insert(0);
-                *old = old.saturating_sub(hist);
-                *proto_bytes.entry(parsed.app.label()).or_insert(0) += hist;
-            }
-            flow.app = parsed.app;
+            relabel(flow, proto_bytes, parsed.app);
+        }
+        // Host already known to torrent: relabel on the spot. The other order
+        // (this flow first, the host's uTP later) is caught by `tick`.
+        if flow.app == AppProto::Obfuscated && bt_hosts.contains(&remote_ip) {
+            relabel(flow, proto_bytes, AppProto::ObfuscatedBt);
         }
         *proto_bytes.entry(flow.app.label()).or_insert(0) += len;
 
@@ -826,10 +929,20 @@ impl TrafficMonitor {
                 inner.archive.push_back(rec);
             }
         }
-        for f in inner.flows.values_mut() {
+        let Inner {
+            flows,
+            proto_bytes,
+            bt_hosts,
+            ..
+        } = &mut *inner;
+        for (k, f) in flows.iter_mut() {
             let total = f.up + f.down;
             f.rate = (total.saturating_sub(f.last_total)) as f64 / dt;
             f.last_total = total;
+            // Obfuscated flows that predate the host's first uTP/DHT packet.
+            if f.app == AppProto::Obfuscated && bt_hosts.contains(&k.remote_ip) {
+                relabel(f, proto_bytes, AppProto::ObfuscatedBt);
+            }
         }
 
         // Publish the view while the lock is already held: one build per tick,
@@ -1226,6 +1339,19 @@ mod tests {
         p
     }
 
+    fn v4_tcp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20 + 20 + payload.len()];
+        p[0] = 0x45; // v4, IHL=5
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[32] = 0x50; // data offset: 5 words, no options
+        p[40..].copy_from_slice(payload);
+        p
+    }
+
     #[test]
     fn classifies_wireguard_by_signature() {
         // Handshake initiation: type=1, 3 reserved zero bytes, exactly 148 bytes.
@@ -1329,6 +1455,120 @@ mod tests {
         hs.extend_from_slice(b"BitTorrent protocol");
         hs.extend_from_slice(&[0u8; 8]);
         assert_eq!(classify(L4::Tcp, 51413, 6881, &hs).label(), "BitTorrent");
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64*), so the test exercises
+    /// the collision statistics of real ciphertext rather than the one-of-each
+    /// byte pattern that trivially hits 8 bits.
+    fn pseudo_random(len: usize, mut seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encrypted_peer_handshakes_are_obfuscated_not_other() {
+        // An MSE opener is a 96-byte DH public key plus 0..512 bytes of random
+        // padding. Over a 256-byte sample, random data tops out near 7.2
+        // bits/byte — the old fixed bar of 7.5 could never be met, and every
+        // encrypted swarm peer fell through to Other.
+        for len in [96, 128, 200, 256, 608, 1400] {
+            for seed in 1..=50u64 {
+                let p = pseudo_random(len, seed * 7919 + len as u64);
+                assert_eq!(
+                    classify(L4::Tcp, 51413, 6881, &p).label(),
+                    "Obfuscated",
+                    "{len}-byte random payload, seed {seed}"
+                );
+                assert_eq!(classify(L4::Udp, 51413, 6881, &p).label(), "Obfuscated");
+            }
+        }
+        // Too short to judge: left for a later, longer packet to upgrade.
+        assert_eq!(classify(L4::Tcp, 51413, 6881, &pseudo_random(64, 3)).label(), "Other");
+    }
+
+    #[test]
+    fn structured_payloads_are_not_mistaken_for_ciphertext() {
+        let text = b"The quick brown fox jumps over the lazy dog, and does it again                      and again until the buffer is comfortably past the sample                      size the entropy estimate draws from; bencode and HTTP are                      no denser than this, so neither can clear the bar either.                      0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        assert!(text.len() > 256);
+        assert_eq!(classify(L4::Tcp, 51413, 6881, text).label(), "Other");
+        assert_eq!(classify(L4::Tcp, 51413, 6881, &text[..100]).label(), "Other");
+        assert_eq!(classify(L4::Tcp, 51413, 6881, &text[..160]).label(), "Other");
+        // Unknown-port HTTP that is not a tracker stays Other too.
+        let get = b"GET /index.html HTTP/1.1\r\nHost: example.org\r\n\r\n";
+        assert_eq!(classify(L4::Tcp, 51413, 6969, get).label(), "Other");
+    }
+
+    #[test]
+    fn classifies_http_trackers_on_any_port() {
+        let app = |port: u16, payload: &[u8]| classify(L4::Tcp, 51413, port, payload).label();
+        let announce = b"GET /announce?info_hash=%AA%BB&peer_id=-qB4600-&port=51413 HTTP/1.1\r\nHost: t\r\n\r\n";
+        assert_eq!(app(6969, announce), "BT Tracker");
+        assert_eq!(app(2710, announce), "BT Tracker");
+        // On 80 the signature beats the port rule, as signatures do everywhere.
+        assert_eq!(app(80, announce), "BT Tracker");
+        // Private-tracker and PHP shapes.
+        assert_eq!(app(6969, b"GET /a1b2c3d4e5/announce?info_hash=x HTTP/1.1\r\n"), "BT Tracker");
+        assert_eq!(app(6969, b"GET /announce.php?passkey=k HTTP/1.0\r\n"), "BT Tracker");
+        assert_eq!(app(6969, b"GET /scrape?info_hash=x HTTP/1.1\r\n"), "BT Tracker");
+        // The word elsewhere in the request is not a match.
+        assert_eq!(app(6969, b"GET /blog/announce-party.html HTTP/1.1\r\n"), "Other");
+        assert_eq!(app(80, b"GET / HTTP/1.1\r\nX: /announce\r\n"), "HTTP");
+        // Unterminated request line within the bound: not a match, no panic.
+        let mut long = b"GET /".to_vec();
+        long.extend(std::iter::repeat(b'a').take(2000));
+        assert_eq!(app(6969, &long), "Other");
+        assert_eq!(app(6969, b"GET /ann"), "Other");
+    }
+
+    #[test]
+    fn encrypted_peers_of_a_torrenting_host_are_relabelled() {
+        let m = TrafficMonitor::new();
+        let cipher = pseudo_random(300, 11);
+        let peer = [5, 6, 7, 8];
+        let other = [9, 9, 9, 9];
+
+        // Host first seen on uTP, then an encrypted TCP connection: relabelled
+        // as soon as the TCP flow is opened.
+        let u = v4_udp([10, 0, 0, 2], peer, 51413, 6881, &utp(4));
+        m.record(Direction::Up, &u);
+        let t = v4_tcp([10, 0, 0, 2], peer, 40001, 6881, &cipher);
+        m.record(Direction::Up, &t);
+        // A host with no uTP/DHT stays plain Obfuscated.
+        let o = v4_tcp([10, 0, 0, 2], other, 40002, 6881, &cipher);
+        m.record(Direction::Up, &o);
+        m.tick();
+        let label = |snap: &TrafficSnapshot, host: &str| {
+            snap.flows
+                .iter()
+                .find(|f| f.proto == "TCP" && f.remote.starts_with(host))
+                .unwrap()
+                .app
+                .to_string()
+        };
+        let snap = m.snapshot();
+        assert_eq!(label(&snap, "5.6.7.8"), "Obfuscated (uTP/DHT)");
+        assert_eq!(label(&snap, "9.9.9.9"), "Obfuscated");
+        // Bytes moved with the relabel.
+        let bt = snap.apps.iter().find(|a| a.name == "Obfuscated (uTP/DHT)").unwrap();
+        assert_eq!(bt.bytes, t.len() as u64);
+        assert_eq!(bt.flows, 1);
+
+        // The other order: the encrypted flow predates the host's first DHT
+        // packet, and the next tick catches up.
+        let d = v4_udp([10, 0, 0, 2], other, 51413, 6881, b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:y1:qe");
+        m.record(Direction::Up, &d);
+        m.tick();
+        assert_eq!(label(&m.snapshot(), "9.9.9.9"), "Obfuscated (uTP/DHT)");
+        // And a later random packet on it does not flip it back.
+        m.record(Direction::Up, &o);
+        m.tick();
+        assert_eq!(label(&m.snapshot(), "9.9.9.9"), "Obfuscated (uTP/DHT)");
     }
 
     #[test]

@@ -2252,6 +2252,8 @@ fn proto_color(app: &str, theme: &Theme) -> Color32 {
         "WireGuard" => Color32::from_rgb(88, 166, 255),
         "OpenVPN" => Color32::from_rgb(255, 149, 0),
         "Shadowsocks" | "Obfuscated" => ERROR_RED,
+        // An encrypted peer of a torrenting host: BitTorrent hue, see below.
+        "Obfuscated (uTP/DHT)" => Color32::from_rgb(70, 175, 165),
         "TLS" => OK_GREEN,
         "QUIC" => Color32::from_rgb(180, 140, 240),
         "DNS" => Color32::from_rgb(230, 200, 100),
@@ -2897,7 +2899,7 @@ mod tests {
             "FWD IDLE ERR REQ",
             // Protocol labels reach the screen from inspect.rs, so they belong
             // in this registry too — `uTP` is one keystroke from `µTP`.
-            "BitTorrent uTP DHT BT Tracker Obfuscated WireGuard OpenVPN Shadowsocks",
+            "BitTorrent uTP DHT BT Tracker Obfuscated (uTP/DHT) WireGuard OpenVPN Shadowsocks",
             "PORT SERVICE BANNER FIELD VALUE ADDRESS PTR ASN ORG PREFIX COUNTRY REGISTRY",
             "ALLOCATED OPEN closed filtered scanning scan complete TOP 100 CUSTOM RUN",
             "well-known ports no open ports found",
