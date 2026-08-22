@@ -12,6 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// broken, which is itself the result the operator wanted.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Resolver used when the engine has not published one (PROBE widget before
+/// the tunnel is up, ASN enrichment on a direct exit).
+pub(crate) const FALLBACK_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
 /// Largest UDP response accepted. Anything bigger is either EDNS0 (which we do
 /// not advertise, so a server must not send it) or not a reply to us.
 const MAX_UDP_RESPONSE: usize = 4096;
@@ -204,6 +208,24 @@ pub struct Request {
     /// Ports for [`Action::PortScan`], already parsed and capped by
     /// [`parse_ports`]. Empty for every other action.
     pub ports: Vec<u16>,
+    /// The traffic monitor to announce every socket to before it sends, so
+    /// the probe's own flows show up tagged `intel` rather than as the host's
+    /// traffic. `None` leaves them untagged (tests).
+    pub monitor: Option<Arc<crate::inspect::TrafficMonitor>>,
+}
+
+impl Request {
+    /// Announce a socket about to talk to `remote` from `local_port`.
+    fn announce(&self, remote: SocketAddr, local_port: u16, tcp: bool) {
+        if let Some(m) = &self.monitor {
+            m.mark_own(remote, local_port, tcp);
+        }
+    }
+
+    /// The hook every UDP lookup to `self.server` passes down the transport.
+    fn udp_hook(&self) -> impl Fn(u16) + '_ {
+        move |port| self.announce(self.server, port, false)
+    }
 }
 
 /// One record from a response, already rendered to text.
@@ -446,14 +468,16 @@ fn nslookup(req: &Request) -> Result<DnsOutcome, String> {
     let query = build_query(next_id(), &question, record.code())?;
     let started = Instant::now();
 
-    let (mut bytes, mut transport) = (query_udp(req.server, &query, req.timeout)?, "udp");
+    let (mut bytes, mut transport) =
+        (query_udp_with(req.server, &query, req.timeout, &req.udp_hook())?, "udp");
     let mut note = None;
 
     // Truncated over UDP: retry over TCP rather than reporting a partial answer
     // as if it were the whole one. Worth surfacing either way — a lookup that
     // needs TCP is a fact about the path.
     if header_truncated(&bytes) {
-        match query_tcp(req.server, &query, req.timeout) {
+        let tcp_hook = |port| req.announce(req.server, port, true);
+        match query_tcp(req.server, &query, req.timeout, &tcp_hook) {
             Ok(full) => {
                 bytes = full;
                 transport = "tcp";
@@ -663,7 +687,8 @@ fn scan(req: &Request, publish: Publish) -> Result<ScanOutcome, String> {
                     break;
                 };
 
-                let (state, found) = probe_port(target, port);
+                let announce = |local| req.announce(SocketAddr::new(target, port), local, true);
+                let (state, found) = probe_port(target, port, &announce);
                 let snapshot = {
                     let mut st = progress.lock().unwrap_or_else(|e| e.into_inner());
                     match state {
@@ -688,10 +713,15 @@ fn scan(req: &Request, publish: Publish) -> Result<ScanOutcome, String> {
     Ok(out)
 }
 
-/// One port: how it answered, and its details when it is open.
-fn probe_port(target: IpAddr, port: u16) -> (PortState, Option<PortResult>) {
+/// One port: how it answered, and its details when it is open. `announce`
+/// sees the local port before the SYN leaves (see `tcp_connect`).
+fn probe_port(
+    target: IpAddr,
+    port: u16,
+    announce: &dyn Fn(u16),
+) -> (PortState, Option<PortResult>) {
     let addr = SocketAddr::new(target, port);
-    let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+    let mut stream = match tcp_connect(addr, CONNECT_TIMEOUT, announce) {
         Ok(s) => s,
         Err(e) => return (connect_state(&e), None),
     };
@@ -755,11 +785,68 @@ fn connect_state(e: &std::io::Error) -> PortState {
 /// independent lookups, a missing field is a missing field, not an error that
 /// throws away the fields that did arrive.
 fn lookup_first(req: &Request, name: &str, qtype: u16) -> Option<String> {
+    lookup_first_at(req.server, req.timeout, name, qtype, &req.udp_hook())
+}
+
+/// `lookup_first` without a `Request`, with a hook that sees the bound local
+/// port before the query is sent — what lets a caller tell the traffic
+/// monitor "this flow is mine" ahead of its first packet.
+fn lookup_first_at(
+    server: SocketAddr,
+    timeout: Duration,
+    name: &str,
+    qtype: u16,
+    before_send: &dyn Fn(u16),
+) -> Option<String> {
     let query = build_query(next_id(), name, qtype).ok()?;
-    let bytes = query_udp(req.server, &query, req.timeout).ok()?;
+    let bytes = query_udp_with(server, &query, timeout, before_send).ok()?;
     let parsed = parse_response(&bytes, &query).ok()?;
     let want = type_name(qtype);
     parsed.answers.into_iter().find(|a| a.kind == want).map(|a| a.data)
+}
+
+/// The origin-ASN record for `ip` from Team Cymru's DNS service, plus the AS
+/// name from a second lookup. Plain DNS against `server`; the host itself is
+/// never contacted. `before_send` is called with each query socket's local
+/// port before it sends (see `lookup_first_at`).
+pub(crate) fn asn_origin(
+    server: SocketAddr,
+    ip: IpAddr,
+    timeout: Duration,
+    before_send: &dyn Fn(u16),
+) -> Option<crate::inspect::AsnInfo> {
+    let zone = match ip {
+        IpAddr::V4(_) => "origin.asn.cymru.com",
+        IpAddr::V6(_) => "origin6.asn.cymru.com",
+    };
+    let name = format!("{}.{}", reverse_labels(ip), zone);
+    let txt = lookup_first_at(server, timeout, &name, 16, before_send)?;
+    let mut info = parse_origin(&txt)?;
+    let org = lookup_first_at(server, timeout, &format!("AS{}.asn.cymru.com", info.asn), 16, before_send);
+    info.org = org
+        .as_deref()
+        .map(cymru_fields)
+        .and_then(|f| non_empty(f.get(4)))
+        .unwrap_or_default();
+    Some(info)
+}
+
+/// Parse an origin TXT ("23028 | 216.90.108.0/24 | US | arin | 1998-09-25")
+/// into the number and prefix. A multi-origin record lists several ASNs
+/// space-separated in the first field; the first is taken.
+fn parse_origin(txt: &str) -> Option<crate::inspect::AsnInfo> {
+    let fields = cymru_fields(txt);
+    let asn = fields
+        .first()?
+        .split_whitespace()
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    Some(crate::inspect::AsnInfo {
+        asn,
+        prefix: fields.get(1).cloned().unwrap_or_default(),
+        org: String::new(),
+    })
 }
 
 /// Split a Team Cymru TXT record into its pipe-separated fields.
@@ -790,9 +877,12 @@ fn intel(req: &Request) -> Result<IntelOutcome, String> {
     let origin = lookup_first(req, &format!("{}.{}", reverse_labels(target), zone), 16);
 
     if let Some(fields) = origin.as_deref().map(cymru_fields) {
-        // "23028 | 216.90.108.0/24 | US | arin | 1998-09-25"
-        out.asn = fields.first().and_then(|s| s.parse::<u32>().ok());
-        out.prefix = non_empty(fields.get(1));
+        // "23028 | 216.90.108.0/24 | US | arin | 1998-09-25". The number and
+        // prefix go through the same parser the background enricher uses.
+        if let Some(info) = origin.as_deref().and_then(parse_origin) {
+            out.asn = Some(info.asn);
+            out.prefix = non_empty(Some(&info.prefix));
+        }
         out.country = non_empty(fields.get(2));
         out.registry = non_empty(fields.get(3));
         out.allocated = non_empty(fields.get(4));
@@ -888,6 +978,18 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn query_udp(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+    query_udp_with(server, query, timeout, &|_| {})
+}
+
+/// `query_udp` with a hook that receives the socket's local port after bind
+/// and before the first send — the window in which a flow can be declared
+/// ours to the traffic monitor before it ever records a packet of it.
+fn query_udp_with(
+    server: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    before_send: &dyn Fn(u16),
+) -> Result<Vec<u8>, String> {
     // Bind in the server's family. The socket is otherwise ordinary and
     // unmarked, which is the point: it takes the host's default route, so under
     // full-tunnel capture it goes through the engine like any other app.
@@ -899,6 +1001,9 @@ fn query_udp(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<Vec<
     sock.connect(server).map_err(|e| format!("connect {server}: {e}"))?;
     sock.set_read_timeout(Some(timeout))
         .map_err(|e| format!("set timeout: {e}"))?;
+    if let Ok(local) = sock.local_addr() {
+        before_send(local.port());
+    }
     sock.send(query).map_err(|e| format!("send to {server}: {e}"))?;
 
     // Read until the ID matches or the budget is spent: a stale datagram from an
@@ -931,8 +1036,36 @@ fn query_udp(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<Vec<
     }
 }
 
-fn query_tcp(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut s = TcpStream::connect_timeout(&server, timeout)
+/// `TcpStream::connect_timeout` with the local port known — and handed to
+/// `before_connect` — before the SYN is sent. An implicit bind would only
+/// reveal the port once the connection exists, by which time the monitor has
+/// already recorded the first packet as somebody else's flow.
+fn tcp_connect(
+    addr: SocketAddr,
+    timeout: Duration,
+    before_connect: &dyn Fn(u16),
+) -> std::io::Result<TcpStream> {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    let any: SocketAddr = match addr {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    sock.bind(&any.into())?;
+    if let Some(local) = sock.local_addr()?.as_socket() {
+        before_connect(local.port());
+    }
+    sock.connect_timeout(&addr.into(), timeout)?;
+    Ok(sock.into())
+}
+
+fn query_tcp(
+    server: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    before_connect: &dyn Fn(u16),
+) -> Result<Vec<u8>, String> {
+    let mut s = tcp_connect(server, timeout, before_connect)
         .map_err(|e| format!("tcp connect {server}: {e}"))?;
     s.set_read_timeout(Some(timeout)).ok();
     s.set_write_timeout(Some(timeout)).ok();
@@ -1302,6 +1435,105 @@ mod tests {
     }
 
     #[test]
+    fn origin_records_parse_to_asn_and_prefix() {
+        let info = parse_origin("\"13335 | 104.16.0.0/13 | US | arin | 2014-03-28\"").unwrap();
+        assert_eq!((info.asn, info.prefix.as_str(), info.org.as_str()), (13335, "104.16.0.0/13", ""));
+        // Multi-origin prefixes list several numbers; the first is taken.
+        assert_eq!(parse_origin("\"13335 16509 | 1.0.0.0/24 | AU | apnic | 2011-08-11\"").unwrap().asn, 13335);
+        assert!(parse_origin("NXDOMAIN").is_none());
+        assert!(parse_origin("").is_none());
+    }
+
+    #[test]
+    fn asn_origin_declares_its_port_before_sending() {
+        // A server that never answers: the lookup must still announce the
+        // socket's bound port to the hook before the query leaves.
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = silent.local_addr().unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hook = |p: u16| seen.borrow_mut().push(p);
+        let got = asn_origin(server, "8.8.8.8".parse().unwrap(), Duration::from_millis(100), &hook);
+        assert!(got.is_none());
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1, "one query, one announcement: {seen:?}");
+        assert_ne!(seen[0], 0);
+        // And the query really did come from that port.
+        let mut buf = [0u8; 512];
+        let (_, from) = silent.recv_from(&mut buf).unwrap();
+        assert_eq!(from.port(), seen[0]);
+    }
+
+    #[test]
+    fn tcp_connect_announces_its_port_before_the_syn() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::cell::Cell::new(0u16);
+        let stream = tcp_connect(addr, Duration::from_secs(1), &|p| seen.set(p)).unwrap();
+        assert_ne!(seen.get(), 0);
+        assert_eq!(stream.local_addr().unwrap().port(), seen.get());
+        let (_peer, from) = listener.accept().unwrap();
+        assert_eq!(from.port(), seen.get());
+        // A refused connect still announced first: the SYN that was refused
+        // is a flow the monitor saw, and it must carry the tag.
+        let closed = {
+            let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        };
+        let seen = std::cell::Cell::new(0u16);
+        assert!(tcp_connect(closed, Duration::from_millis(300), &|p| seen.set(p)).is_err());
+        assert_ne!(seen.get(), 0);
+    }
+
+    #[test]
+    fn a_request_with_a_monitor_tags_its_flows_intel() {
+        use crate::inspect::{Direction, TrafficMonitor};
+        let monitor = Arc::new(TrafficMonitor::new());
+        let req = Request {
+            action: Action::Nslookup,
+            target: "example.org".to_string(),
+            record: RecordType::A,
+            server: "1.1.1.1:53".parse().unwrap(),
+            timeout: Duration::from_millis(1),
+            ports: Vec::new(),
+            monitor: Some(monitor.clone()),
+        };
+        // The hooks land on the monitor as pending marks; the first packet of
+        // each flow then picks them up.
+        (req.udp_hook())(40001);
+        req.announce("93.184.216.34:443".parse().unwrap(), 40002, true);
+
+        let mut udp = vec![0u8; 20 + 8 + 17];
+        udp[0] = 0x45;
+        udp[9] = 17;
+        udp[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        udp[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        udp[20..22].copy_from_slice(&40001u16.to_be_bytes());
+        udp[22..24].copy_from_slice(&53u16.to_be_bytes());
+        udp[28..30].copy_from_slice(&[0x12, 0x34]);
+        udp[30] = 1;
+        monitor.record(Direction::Up, &udp);
+
+        let mut tcp = vec![0u8; 40];
+        tcp[0] = 0x45;
+        tcp[9] = 6;
+        tcp[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        tcp[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        tcp[20..22].copy_from_slice(&40002u16.to_be_bytes());
+        tcp[22..24].copy_from_slice(&443u16.to_be_bytes());
+        tcp[32] = 0x50;
+        monitor.record(Direction::Up, &tcp);
+
+        monitor.tick();
+        let snap = monitor.snapshot();
+        for (port, proto) in [(40001, "UDP"), (40002, "TCP")] {
+            let f = snap.flows.iter().find(|f| f.local_port == port).unwrap();
+            assert_eq!((f.proto, f.origin), (proto, "intel"), "port {port}");
+        }
+    }
+
+    #[test]
     fn reverse_names_follow_the_arpa_zones() {
         assert_eq!(
             reverse_name("8.8.4.4".parse().unwrap()),
@@ -1453,6 +1685,7 @@ mod tests {
             server: "127.0.0.1:53".parse().unwrap(),
             timeout: Duration::from_millis(1),
             ports: Vec::new(),
+            monitor: None,
         };
         let err = nslookup(&req("1.1.1.1", RecordType::Mx)).unwrap_err();
         assert!(err.contains("only PTR"), "{err}");
@@ -1527,6 +1760,7 @@ mod tests {
             server: "127.0.0.1:53".parse().unwrap(),
             timeout: Duration::from_millis(200),
             ports: vec![open_port, closed_port],
+            monitor: None,
         };
 
         let seen = Mutex::new(Vec::new());
@@ -1568,6 +1802,7 @@ mod tests {
             server: "127.0.0.1:53".parse().unwrap(),
             timeout: Duration::from_millis(1),
             ports,
+            monitor: None,
         };
         assert!(scan(&req(Vec::new()), &|_| {}).is_err());
         assert!(scan(&req(vec![80; MAX_SCAN_PORTS + 1]), &|_| {})

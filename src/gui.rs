@@ -2,12 +2,13 @@
 
 use eframe::egui::{self, Align, Color32, Layout, Rounding, Stroke, Vec2};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::inspect::TrafficSnapshot;
 use crate::probe;
-use crate::probe::clamp_to;
+use crate::probe::{clamp_to, FALLBACK_DNS};
 use crate::state::{Forward, Shared, Status};
 
 // ---------------------------------------------------------------------------
@@ -48,9 +49,6 @@ const DEFAULT_ROW_H: f32 = 250.0;
 /// Point size every table and label is drawn at. Column budgets are computed
 /// from this, so the two cannot drift apart.
 const MONO_PT: f32 = 10.0;
-/// Fallback resolver for the PROBE widget before the engine has published one.
-const FALLBACK_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
-
 /// `Copy` because half the render tree wants the palette while the same
 /// statement holds a `&mut` to the widget being drawn; a borrowed theme would
 /// make every one of those a borrow conflict for no benefit — it is nine
@@ -191,16 +189,43 @@ enum Sort {
     Bytes,
     Rate,
     Recent,
+    /// Cluster rows by the selected [`GroupBy`] key, then by peer, then bytes.
+    Group,
 }
 
 impl Sort {
-    const ALL: [Sort; 3] = [Sort::Bytes, Sort::Rate, Sort::Recent];
+    const ALL: [Sort; 4] = [Sort::Bytes, Sort::Rate, Sort::Recent, Sort::Group];
 
     fn label(self) -> &'static str {
         match self {
             Sort::Bytes => "bytes",
             Sort::Rate => "rate",
             Sort::Recent => "recent",
+            Sort::Group => "group",
+        }
+    }
+}
+
+/// What the GROUP column shows, and what `Sort::Group` clusters on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupBy {
+    /// The local port: every peer of one local application/session (a torrent
+    /// client's listen port, say) shares it.
+    LocalPort,
+    /// The remote /24 (v6: /64).
+    Prefix,
+    /// The remote network's ASN, once the enricher has looked it up.
+    Asn,
+}
+
+impl GroupBy {
+    const ALL: [GroupBy; 3] = [GroupBy::LocalPort, GroupBy::Prefix, GroupBy::Asn];
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::LocalPort => "port",
+            GroupBy::Prefix => "/24",
+            GroupBy::Asn => "asn",
         }
     }
 }
@@ -215,12 +240,18 @@ impl Sort {
 struct FlowUi {
     filter: String,
     sort: Sort,
+    group: GroupBy,
     hide_idle: bool,
 }
 
 impl Default for FlowUi {
     fn default() -> Self {
-        FlowUi { filter: String::new(), sort: Sort::Bytes, hide_idle: false }
+        FlowUi {
+            filter: String::new(),
+            sort: Sort::Bytes,
+            group: GroupBy::Prefix,
+            hide_idle: false,
+        }
     }
 }
 
@@ -501,10 +532,12 @@ struct Table {
 const FLOWS: Table = Table {
     cols: &[
         Col::new("REMOTE", 0, false, 0),
+        Col::new("PEER", 6, false, 4),
+        Col::new("GROUP", 16, false, 3),
         Col::new("APP", 11, false, 2),
-        Col::new("L4", 5, false, 4),
+        Col::new("L4", 5, false, 6),
         Col::new("RX", 8, true, 1),
-        Col::new("TX", 8, true, 3),
+        Col::new("TX", 8, true, 5),
         Col::new("RATE", 11, true, 0),
     ],
     flex: (14, 38),
@@ -514,7 +547,9 @@ const FLOWS: Table = Table {
 const HOSTS: Table = Table {
     cols: &[
         Col::new("HOST", 0, false, 0),
+        Col::new("PEER", 6, false, 4),
         Col::new("APP", 10, false, 2),
+        Col::new("ASN", 8, false, 5),
         Col::new("FL", 4, true, 3),
         Col::new("BYTES", 8, true, 1),
         Col::new("RATE", 10, true, 0),
@@ -836,6 +871,9 @@ impl TunnelApp {
     /// under each band.
     fn dashboard(&mut self, ui: &mut egui::Ui, traffic: &Arc<TrafficSnapshot>, dns: Option<Ipv4Addr>) {
         let theme = self.theme;
+        let shared = self.shared.clone();
+        let enrich = &shared.enrich;
+        let monitor = &shared.monitor;
         let avail = ui.available_size();
 
         // How many widgets a band can hold before one of them would be too
@@ -899,7 +937,7 @@ impl TunnelApp {
                                     h,
                                     &theme,
                                     |ui| view_selector(ui, wid, &mut next_view, &theme),
-                                    |ui| render_widget(ui, w, traffic, &theme, dns),
+                                    |ui| render_widget(ui, w, traffic, &theme, dns, enrich, monitor),
                                 );
                             }
                             self.rows[band.row].widgets[i].view = next_view;
@@ -1191,17 +1229,19 @@ fn render_widget(
     traffic: &TrafficSnapshot,
     theme: &Theme,
     dns: Option<Ipv4Addr>,
+    enrich: &AtomicBool,
+    monitor: &Arc<crate::inspect::TrafficMonitor>,
 ) {
     let id = w.id;
     match w.view {
         View::Throughput => draw_chart(ui, traffic, theme),
-        View::Flows => flows_pane(ui, id, traffic, &mut w.flow, theme),
+        View::Flows => flows_pane(ui, id, traffic, &mut w.flow, theme, enrich),
         View::Protocols => render_protocols(ui, id, traffic, theme),
         View::Hosts => render_hosts(ui, id, traffic, theme),
         View::Services => render_services(ui, id, traffic, theme),
         View::Composition => render_composition(ui, id, traffic, theme),
         View::Counters => render_counters(ui, id, traffic, theme),
-        View::Probe => render_probe(ui, id, &mut w.probe, traffic, theme, dns),
+        View::Probe => render_probe(ui, id, &mut w.probe, traffic, theme, dns, monitor),
     }
 }
 
@@ -1340,6 +1380,7 @@ fn flows_pane(
     traffic: &TrafficSnapshot,
     state: &mut FlowUi,
     theme: &Theme,
+    enrich: &AtomicBool,
 ) {
     let wide = ui.available_width() >= 330.0;
     ui.horizontal(|ui| {
@@ -1355,27 +1396,67 @@ fn flows_pane(
             selected,
             62.0,
         );
+        let selected = mono(state.group.label(), 9.0).color(theme.text_muted);
+        enum_combo(
+            ui,
+            ("flow_group", wid),
+            &mut state.group,
+            &GroupBy::ALL,
+            GroupBy::label,
+            selected,
+            52.0,
+        );
         // The caption is the checkbox's own label, not a neighbouring one, so
         // the words are part of the click target instead of a 12px box being
         // the only way to hit it. Dropped when narrow, as before.
         let live_label = if wide { "live only" } else { "" };
         ui.checkbox(&mut state.hide_idle, mono(live_label, 9.0).color(theme.text_muted));
+        // ASN enrichment sends every remote address to the resolver; the
+        // switch is here, next to the column it fills, rather than in a config.
+        let mut on = enrich.load(Ordering::Relaxed);
+        let asn_label = if wide { "asn" } else { "" };
+        if ui
+            .checkbox(&mut on, mono(asn_label, 9.0).color(theme.text_muted))
+            .on_hover_text("look up each host's network (ASN) through the resolver")
+            .changed()
+        {
+            enrich.store(on, Ordering::Relaxed);
+        }
     });
     ui.add_space(ROW_GAP);
 
     render_flows(ui, wid, traffic, state, theme);
 }
 
-fn render_flows(
-    ui: &mut egui::Ui,
-    wid: u64,
-    traffic: &TrafficSnapshot,
-    state: &FlowUi,
-    theme: &Theme,
-) {
-    // Filter and sort by reference — the snapshot is shared, so the view is a
-    // vector of borrows, never a clone of the rows.
+/// The GROUP cell for a row under grouping `g`.
+fn group_text(f: &crate::inspect::FlowRow, g: GroupBy) -> String {
+    match g {
+        GroupBy::LocalPort => f.local_port.to_string(),
+        GroupBy::Prefix => f.prefix.clone(),
+        GroupBy::Asn => match f.asn {
+            Some(a) if f.org.is_empty() => format!("AS{a}"),
+            Some(a) => format!("AS{a} {}", f.org),
+            None => "—".to_string(),
+        },
+    }
+}
+
+/// The PEER cell: a session-stable short id, or a dash once the host has
+/// aged out of the arena.
+fn peer_text(peer: u32) -> String {
+    if peer == 0 {
+        "—".to_string()
+    } else {
+        format!("p{peer}")
+    }
+}
+
+/// The rows the FLOWS widget shows, filtered and ordered. By reference — the
+/// snapshot is shared, so the view is a vector of borrows, never a clone.
+/// Separate from drawing so the ordering and matching are testable headless.
+fn visible_rows<'a>(traffic: &'a TrafficSnapshot, state: &FlowUi) -> Vec<&'a crate::inspect::FlowRow> {
     let needle = state.filter.to_lowercase();
+    let g = state.group;
     let mut rows: Vec<&crate::inspect::FlowRow> = traffic
         .flows
         .iter()
@@ -1385,6 +1466,9 @@ fn render_flows(
                 || f.remote.to_lowercase().contains(&needle)
                 || f.app.to_lowercase().contains(&needle)
                 || f.proto.to_lowercase().contains(&needle)
+                || f.origin.contains(&needle)
+                || peer_text(f.peer).contains(&needle)
+                || group_text(f, g).to_lowercase().contains(&needle)
         })
         .collect();
 
@@ -1393,7 +1477,29 @@ fn render_flows(
         Sort::Bytes => {}
         Sort::Rate => rows.sort_by(|a, b| b.rate.total_cmp(&a.rate)),
         Sort::Recent => rows.sort_by_key(|f| f.idle_ms),
+        Sort::Group => rows.sort_by(|a, b| {
+            let key = match g {
+                GroupBy::LocalPort => a.local_port.cmp(&b.local_port),
+                GroupBy::Prefix => a.prefix.cmp(&b.prefix),
+                // Unknown networks sort last, known ones by number.
+                GroupBy::Asn => a.asn.is_none().cmp(&b.asn.is_none()).then(a.asn.cmp(&b.asn)),
+            };
+            key.then(a.peer.cmp(&b.peer))
+                .then((b.up + b.down).cmp(&(a.up + a.down)))
+        }),
     }
+    rows
+}
+
+fn render_flows(
+    ui: &mut egui::Ui,
+    wid: u64,
+    traffic: &TrafficSnapshot,
+    state: &FlowUi,
+    theme: &Theme,
+) {
+    let rows = visible_rows(traffic, state);
+    let g = state.group;
 
     let empty = if traffic.flows.is_empty() {
         "no traffic yet"
@@ -1405,15 +1511,21 @@ fn render_flows(
         // Shed / reaped rows are deliberate admission-control actions, not live
         // conversations — render the whole row muted and swap the rate cell for
         // a status badge so they don't read as anomalous up-only or half-open
-        // flows.
+        // flows. Rows this process opened itself (ASN lookups) are muted too,
+        // with the APP cell saying so in the accent colour: they must never
+        // pass for the host's own DNS.
         let tagged = !f.status.is_empty();
-        let base = if tagged || f.idle_ms > 5000 {
+        let ours = !f.origin.is_empty();
+        let base = if tagged || ours || f.idle_ms > 5000 {
             theme.text_muted
         } else {
             theme.text_secondary
         };
         match title {
             "REMOTE" => (f.remote.clone(), base),
+            "PEER" => (peer_text(f.peer), theme.text_muted),
+            "GROUP" => (group_text(f, g), base),
+            "APP" if ours => (format!("{} {}", f.app, f.origin), theme.accent),
             "APP" => (
                 f.app.to_string(),
                 if tagged { theme.text_muted } else { proto_color(f.app, theme) },
@@ -1445,6 +1557,7 @@ fn render_probe(
     traffic: &TrafficSnapshot,
     theme: &Theme,
     dns: Option<Ipv4Addr>,
+    monitor: &Arc<crate::inspect::TrafficMonitor>,
 ) {
     // Seed the resolver from the engine's pinned one the first time it exists,
     // so the probe asks the same nameserver everything else on this host asks.
@@ -1618,7 +1731,7 @@ fn render_probe(
     });
 
     if go && !busy {
-        match build_request(p) {
+        match build_request(p, monitor) {
             Ok(req) => {
                 p.last = None;
                 p.job = Some(probe::spawn(req));
@@ -1644,7 +1757,10 @@ fn render_probe(
 /// specification is a message under the controls instead of a thread that
 /// starts and immediately fails — and so `MAX_SCAN_PORTS` is enforced before
 /// anything opens a socket.
-fn build_request(p: &ProbeUi) -> Result<probe::Request, String> {
+fn build_request(
+    p: &ProbeUi,
+    monitor: &Arc<crate::inspect::TrafficMonitor>,
+) -> Result<probe::Request, String> {
     let ports = match (p.action.0, p.port_mode) {
         (probe::Action::PortScan, PortMode::Top) => probe::TOP_PORTS.to_vec(),
         (probe::Action::PortScan, PortMode::Custom) => probe::parse_ports(&p.ports)?,
@@ -1657,6 +1773,7 @@ fn build_request(p: &ProbeUi) -> Result<probe::Request, String> {
         server: parse_server(&p.server)?,
         timeout: probe::DEFAULT_TIMEOUT,
         ports,
+        monitor: Some(monitor.clone()),
     })
 }
 
@@ -2028,7 +2145,12 @@ fn render_hosts(ui: &mut egui::Ui, wid: u64, traffic: &TrafficSnapshot, theme: &
             };
             match title {
                 "HOST" => (h.ip.clone(), base),
+                "PEER" => (peer_text(h.peer), theme.text_muted),
                 "APP" => (h.app.to_string(), proto_color(h.app, theme)),
+                "ASN" => (
+                    h.asn.map(|a| format!("AS{a}")).unwrap_or_else(|| "—".to_string()),
+                    theme.text_muted,
+                ),
                 "FL" => (h.flows.to_string(), theme.text_muted),
                 "BYTES" => (format_bytes_short(h.up + h.down), base),
                 _ => rate_cell(h.rate, theme),
@@ -2431,10 +2553,13 @@ mod tests {
 
     #[test]
     fn wide_budget_keeps_every_column_and_widens_the_flexible_one() {
-        assert_eq!(at(80), ["REMOTE", "APP", "L4", "RX", "TX", "RATE"]);
-        // 43 fixed characters; REMOTE takes the slack first, up to its cap.
-        assert_eq!(plan_of(&FLOWS, 60)[0].width, 17);
-        assert_eq!(plan_of(&FLOWS, 80)[0].width, 37);
+        assert_eq!(
+            at(80),
+            ["REMOTE", "PEER", "GROUP", "APP", "L4", "RX", "TX", "RATE"]
+        );
+        // 65 fixed characters; REMOTE takes the slack first, up to its cap.
+        assert_eq!(plan_of(&FLOWS, 90)[0].width, 25);
+        assert_eq!(plan_of(&FLOWS, 100)[0].width, 35);
     }
 
     #[test]
@@ -2443,7 +2568,7 @@ mod tests {
         // remaining 129 characters are shared among the OTHERS, so the row spans
         // the full width without one enormous gap after the address.
         let plan = plan_of(&FLOWS, 210);
-        assert_eq!(plan.len(), 6);
+        assert_eq!(plan.len(), 8);
         assert_eq!(plan.iter().map(|c| c.width).sum::<usize>(), 210);
         assert_eq!(plan[0].width, 38);
         // Every other column shares in the slack; none is left at its base width.
@@ -2457,7 +2582,7 @@ mod tests {
         let mut widths: Vec<usize> = plan.iter().map(|c| c.width).collect();
         widths.sort_unstable();
         assert!(
-            widths[5] - widths[4] <= 16,
+            widths[7] - widths[6] <= 16,
             "one column took the slack: {widths:?}"
         );
 
@@ -2508,11 +2633,16 @@ mod tests {
 
     #[test]
     fn narrowing_drops_columns_in_priority_order() {
-        assert_eq!(at(57), ["REMOTE", "APP", "L4", "RX", "TX", "RATE"]);
-        assert_eq!(at(52), ["REMOTE", "APP", "RX", "TX", "RATE"]); // L4 out
-        assert_eq!(at(44), ["REMOTE", "APP", "RX", "RATE"]); // TX out
-        assert_eq!(at(34), ["REMOTE", "RX", "RATE"]); // APP out
-        assert_eq!(at(30), ["REMOTE", "RATE"]); // RX out
+        assert_eq!(
+            at(79),
+            ["REMOTE", "PEER", "GROUP", "APP", "L4", "RX", "TX", "RATE"]
+        );
+        assert_eq!(at(74), ["REMOTE", "PEER", "GROUP", "APP", "RX", "TX", "RATE"]); // L4 out
+        assert_eq!(at(66), ["REMOTE", "PEER", "GROUP", "APP", "RX", "RATE"]); // TX out
+        assert_eq!(at(60), ["REMOTE", "GROUP", "APP", "RX", "RATE"]); // PEER out
+        assert_eq!(at(44), ["REMOTE", "APP", "RX", "RATE"]); // GROUP out
+        assert_eq!(at(33), ["REMOTE", "RX", "RATE"]); // APP out
+        assert_eq!(at(25), ["REMOTE", "RATE"]); // RX out
         // The identifying column and the headline measure are never dropped,
         // however narrow the cell gets.
         assert_eq!(at(4), ["REMOTE", "RATE"]);
@@ -2710,7 +2840,8 @@ mod tests {
             assert!(!kind.label().is_empty());
         }
         assert_eq!(View::ALL.len(), 8);
-        assert_eq!(Sort::ALL.len(), 3);
+        assert_eq!(Sort::ALL.len(), 4);
+        assert_eq!(GroupBy::ALL.len(), 3);
         // The probe widget must be offered, or the action it fronts is dead code.
         assert!(View::ALL.contains(&View::Probe));
     }
@@ -2824,6 +2955,12 @@ mod tests {
                     rate: 64.0,
                     idle_ms: 40,
                     status: "",
+                    peer: 1,
+                    local_port: 40001,
+                    prefix: "1.1.1.0/24".into(),
+                    asn: Some(13335),
+                    org: "CLOUDFLARENET".into(),
+                    origin: "intel",
                 },
                 FlowRow {
                     remote: "93.184.216.34:443".into(),
@@ -2834,11 +2971,37 @@ mod tests {
                     rate: 0.0,
                     idle_ms: 90_000,
                     status: "reaped",
+                    peer: 2,
+                    local_port: 40002,
+                    prefix: "93.184.216.0/24".into(),
+                    asn: None,
+                    org: String::new(),
+                    origin: "",
                 },
             ],
             hosts: vec![
-                HostRow { ip: "1.1.1.1".into(), app: "DNS", flows: 1, up: 300, down: 900, rate: 64.0, idle_ms: 40 },
-                HostRow { ip: "93.184.216.34".into(), app: "TLS", flows: 1, up: 9_000, down: 800_000, rate: 0.0, idle_ms: 90_000 },
+                HostRow {
+                    ip: "1.1.1.1".into(),
+                    app: "DNS",
+                    flows: 1,
+                    up: 300,
+                    down: 900,
+                    rate: 64.0,
+                    idle_ms: 40,
+                    peer: 1,
+                    asn: Some(13335),
+                },
+                HostRow {
+                    ip: "93.184.216.34".into(),
+                    app: "TLS",
+                    flows: 1,
+                    up: 9_000,
+                    down: 800_000,
+                    rate: 0.0,
+                    idle_ms: 90_000,
+                    peer: 2,
+                    asn: None,
+                },
             ],
             ports: vec![
                 PortRow { port: 53, l4: "UDP", service: "dns", flows: 1, up: 300, down: 900, rate: 64.0 },
@@ -2871,6 +3034,53 @@ mod tests {
     }
 
     #[test]
+    fn sort_group_orders_by_group_then_peer() {
+        let t = populated();
+        let mut state = FlowUi { sort: Sort::Group, ..FlowUi::default() };
+
+        // /24: "1.1.1.0/24" sorts before "93.184.216.0/24".
+        state.group = GroupBy::Prefix;
+        let rows = visible_rows(&t, &state);
+        assert_eq!(rows.iter().map(|f| f.peer).collect::<Vec<_>>(), [1, 2]);
+
+        // Local port: numeric, 40001 before 40002.
+        state.group = GroupBy::LocalPort;
+        let rows = visible_rows(&t, &state);
+        assert_eq!(rows.iter().map(|f| f.local_port).collect::<Vec<_>>(), [40001, 40002]);
+
+        // ASN: the unknown network sorts last whatever its bytes.
+        state.group = GroupBy::Asn;
+        let rows = visible_rows(&t, &state);
+        assert_eq!(rows[0].asn, Some(13335));
+        assert_eq!(rows[1].asn, None);
+        assert_eq!(group_text(rows[0], GroupBy::Asn), "AS13335 CLOUDFLARENET");
+        assert_eq!(group_text(rows[1], GroupBy::Asn), "—");
+    }
+
+    #[test]
+    fn filter_matches_peer_id_group_and_intel() {
+        let t = populated();
+        let mut state = FlowUi::default();
+        let remotes = |state: &FlowUi| {
+            visible_rows(&t, state).iter().map(|f| f.remote.clone()).collect::<Vec<_>>()
+        };
+
+        state.filter = "p2".into();
+        assert_eq!(remotes(&state), ["93.184.216.34:443"]);
+        state.filter = "intel".into();
+        assert_eq!(remotes(&state), ["1.1.1.1:53"]);
+        state.filter = "cloudflarenet".into();
+        state.group = GroupBy::Asn;
+        assert_eq!(remotes(&state), ["1.1.1.1:53"]);
+        state.filter = "93.184.216.0/24".into();
+        state.group = GroupBy::Prefix;
+        assert_eq!(remotes(&state), ["93.184.216.34:443"]);
+        // The group text only matches under the grouping that shows it.
+        state.group = GroupBy::LocalPort;
+        assert!(remotes(&state).is_empty());
+    }
+
+    #[test]
     fn every_glyph_the_dashboard_draws_has_a_font_behind_it() {
         // egui ships a narrow font set — Hack for monospace, Ubuntu-Light for
         // proportional — and renders anything they lack as a tofu box. A source
@@ -2891,6 +3101,9 @@ mod tests {
         for s in Sort::ALL {
             text.push_str(s.label());
         }
+        for g in GroupBy::ALL {
+            text.push_str(g.label());
+        }
         for r in probe::RecordType::ALL {
             text.push_str(r.label());
         }
@@ -2910,6 +3123,8 @@ mod tests {
             "nameserver to ask; defaults to the resolver the tunnel pinned",
             "RX TX RATIO PKT MEAN TCP UDP LIVE ARCHIV HOSTS SVCS DOWN UP FLOWS PKTS peak",
             "REMOTE APP L4 RATE HOST BYTES FL PORT SERVICE PROTOCOL SHARE NAME TYPE TTL DATA",
+            "PEER GROUP ASN intel asn p0123456789",
+            "look up each host's network (ASN) through the resolver",
             "NOERROR FORMERR SERVFAIL NXDOMAIN NOTIMP REFUSED ans ms udp tcp auth",
             "GBMKBds", // the byte, rate and TTL suffixes
         ] {

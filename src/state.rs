@@ -90,6 +90,10 @@ pub struct Shared {
     /// Set by the GUI on window close to ask the engine to shut down cleanly
     /// (so its route guard restores networking before the process exits).
     pub shutdown: AtomicBool,
+    /// Whether the background ASN enricher (enrich.rs) may run. It sends every
+    /// remote address, reversed, to the resolver — on by default, and one
+    /// click to stop from the FLOWS toolbar.
+    pub enrich: AtomicBool,
 }
 
 #[derive(Clone, Default)]
@@ -126,6 +130,7 @@ impl Shared {
             status: Mutex::new(Status::default()),
             session: SessionPaths::new(),
             shutdown: AtomicBool::new(false),
+            enrich: AtomicBool::new(true),
         })
     }
 }

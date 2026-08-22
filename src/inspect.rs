@@ -1,8 +1,8 @@
 //! Traffic inspection for observability.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -28,8 +28,17 @@ const MAX_PORTS: usize = 64;
 /// count is reported once at shutdown.
 const MAX_ARCHIVE: usize = 65_536;
 
-/// Cap on remote hosts remembered as uTP/DHT speakers (see `Inner::bt_hosts`).
-const MAX_BT_HOSTS: usize = 65_536;
+/// Remote hosts remembered at once (see `PeerArena`). Least recently seen is
+/// evicted to make room, so learning never stops. Sized at `MAX_LIVE_FLOWS`:
+/// every live flow refreshes its host each tick, so with at least as many
+/// slots as flows a host with a live flow is never the one evicted, and its
+/// id stays put for as long as it is on screen.
+const PEER_ARENA: usize = MAX_LIVE_FLOWS;
+/// How long a pending self-mark (`TrafficMonitor::mark_own`) waits for its
+/// first packet before it is forgotten.
+const OWN_MARK_TTL: Duration = Duration::from_secs(30);
+/// Prefixes whose ASN lookup result is remembered, positive or negative.
+const ASN_CACHE_MAX: usize = 4096;
 
 /// Packet direction relative to the local host.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -214,6 +223,89 @@ impl FlowStatus {
             FlowStatus::Reaped => "reaped",
         }
     }
+}
+
+/// Coarse protocol families, as bits, for what a remote host has been seen
+/// doing across all of its flows. One `u16` per host is what makes remembering
+/// thousands of them cheap.
+pub mod family {
+    pub const BT_PEER: u16 = 1 << 0;
+    pub const UTP: u16 = 1 << 1;
+    pub const DHT: u16 = 1 << 2;
+    pub const BT_TRACKER: u16 = 1 << 3;
+    pub const TLS: u16 = 1 << 4;
+    pub const QUIC: u16 = 1 << 5;
+    pub const DNS: u16 = 1 << 6;
+    pub const HTTP: u16 = 1 << 7;
+    pub const SSH: u16 = 1 << 8;
+    /// WireGuard, OpenVPN, Shadowsocks.
+    pub const VPN: u16 = 1 << 9;
+    pub const OBFUSCATED: u16 = 1 << 10;
+    /// mDNS, LLMNR, SSDP, NetBIOS, DHCP, IGMP — things that do not leave a LAN.
+    pub const LAN: u16 = 1 << 11;
+    pub const OTHER: u16 = 1 << 15;
+    /// A host with either of these is a BitTorrent client.
+    pub const TORRENTING: u16 = UTP | DHT;
+}
+
+impl AppProto {
+    /// The family bit(s) this label contributes to a host's memory.
+    pub fn family(self) -> u16 {
+        use family::*;
+        match self {
+            AppProto::BitTorrent => BT_PEER,
+            AppProto::Utp => UTP,
+            AppProto::Dht => DHT,
+            AppProto::BtTracker => BT_TRACKER,
+            AppProto::Tls => TLS,
+            AppProto::Quic => QUIC,
+            AppProto::Dns => DNS,
+            AppProto::Http => HTTP,
+            AppProto::Ssh => SSH,
+            AppProto::WireGuard | AppProto::OpenVpn | AppProto::Shadowsocks => VPN,
+            AppProto::Obfuscated => OBFUSCATED,
+            AppProto::ObfuscatedBt => OBFUSCATED | BT_PEER,
+            AppProto::Mdns
+            | AppProto::Llmnr
+            | AppProto::Ssdp
+            | AppProto::NetBios
+            | AppProto::Dhcp
+            | AppProto::Dhcpv6
+            | AppProto::Igmp => LAN,
+            AppProto::Ntp | AppProto::Icmp | AppProto::Other => OTHER,
+        }
+    }
+}
+
+/// Who opened a flow. `Host` is ordinary traffic; `Intel` is one of this
+/// process's own lookups (ASN enrichment), which rides the tunnel like any
+/// other socket and would otherwise be indistinguishable from the host's DNS.
+/// Separate from `FlowStatus` because that field belongs to the connection
+/// manager, which resets it on admission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Host,
+    Intel,
+}
+
+impl Origin {
+    /// Display/CSV label; empty for ordinary flows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Host => "",
+            Origin::Intel => "intel",
+        }
+    }
+}
+
+/// What an origin-ASN lookup says about an address's network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsnInfo {
+    pub asn: u32,
+    /// The announced prefix, e.g. "104.16.0.0/13".
+    pub prefix: String,
+    /// The AS name, e.g. "CLOUDFLARENET"; empty if the second lookup failed.
+    pub org: String,
 }
 
 /// A parsed packet's routing-relevant fields.
@@ -635,6 +727,223 @@ fn entropy(p: &[u8]) -> f64 {
     h
 }
 
+const NIL: u32 = u32::MAX;
+
+/// What the monitor remembers about one remote host, across every flow it has
+/// ever had with it.
+struct PeerEntry {
+    ip: IpAddr,
+    /// Session-unique short id, assigned on first sight and never reused, so
+    /// "p17" in the table always means the same host.
+    id: u32,
+    /// `family::*` bits accumulated from every flow's final label.
+    families: u16,
+    /// Recency for eviction; refreshed by `touch`.
+    last_seen: Instant,
+    asn: Option<AsnInfo>,
+    prev: u32,
+    next: u32,
+}
+
+/// Fixed-capacity LRU of remote hosts: a slab of entries threaded on an
+/// intrusive doubly-linked list (most recent at `head`), plus an index by
+/// address. Every operation is O(1); slots are reused after eviction and no
+/// allocation happens once the arena is warm.
+struct PeerArena {
+    entries: Vec<PeerEntry>,
+    index: HashMap<IpAddr, u32>,
+    head: u32,
+    tail: u32,
+    next_id: u32,
+    cap: usize,
+}
+
+impl PeerArena {
+    fn new(cap: usize) -> Self {
+        PeerArena {
+            entries: Vec::with_capacity(cap.min(1024)),
+            index: HashMap::new(),
+            head: NIL,
+            tail: NIL,
+            next_id: 1,
+            cap: cap.max(1),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Note a host as just seen with `fam` bits, inserting it (evicting the
+    /// least recently seen host if full) or moving it to the front. Returns its id.
+    fn touch(&mut self, ip: IpAddr, fam: u16, now: Instant) -> u32 {
+        if let Some(&i) = self.index.get(&ip) {
+            let e = &mut self.entries[i as usize];
+            e.families |= fam;
+            e.last_seen = now;
+            let id = e.id;
+            if self.head != i {
+                self.unlink(i);
+                self.push_front(i);
+            }
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let fresh = PeerEntry {
+            ip,
+            id,
+            families: fam,
+            last_seen: now,
+            asn: None,
+            prev: NIL,
+            next: NIL,
+        };
+        let i = if self.index.len() >= self.cap {
+            let i = self.evict_tail();
+            self.entries[i as usize] = fresh;
+            i
+        } else {
+            self.entries.push(fresh);
+            (self.entries.len() - 1) as u32
+        };
+        self.index.insert(ip, i);
+        self.push_front(i);
+        id
+    }
+
+    /// Like `touch`, but only for a host already present: refreshes recency
+    /// and families, never inserts. What `tick` uses, so a host that has
+    /// already aged out is not churned back in by a long-lived flow.
+    fn refresh(&mut self, ip: IpAddr, fam: u16, now: Instant) {
+        if self.index.contains_key(&ip) {
+            self.touch(ip, fam, now);
+        }
+    }
+
+    fn get(&self, ip: IpAddr) -> Option<&PeerEntry> {
+        self.index.get(&ip).map(|&i| &self.entries[i as usize])
+    }
+
+    fn get_mut(&mut self, ip: IpAddr) -> Option<&mut PeerEntry> {
+        match self.index.get(&ip) {
+            Some(&i) => Some(&mut self.entries[i as usize]),
+            None => None,
+        }
+    }
+
+    fn is_torrenting(&self, ip: IpAddr) -> bool {
+        self.get(ip)
+            .is_some_and(|e| e.families & family::TORRENTING != 0)
+    }
+
+    /// Entries from most to least recently seen.
+    fn iter_mru(&self) -> impl Iterator<Item = &PeerEntry> {
+        let mut cur = self.head;
+        std::iter::from_fn(move || {
+            if cur == NIL {
+                return None;
+            }
+            let e = &self.entries[cur as usize];
+            cur = e.next;
+            Some(e)
+        })
+    }
+
+    fn unlink(&mut self, i: u32) {
+        let (prev, next) = {
+            let e = &self.entries[i as usize];
+            (e.prev, e.next)
+        };
+        match prev {
+            NIL => self.head = next,
+            p => self.entries[p as usize].next = next,
+        }
+        match next {
+            NIL => self.tail = prev,
+            n => self.entries[n as usize].prev = prev,
+        }
+        let e = &mut self.entries[i as usize];
+        e.prev = NIL;
+        e.next = NIL;
+    }
+
+    fn push_front(&mut self, i: u32) {
+        let old = self.head;
+        {
+            let e = &mut self.entries[i as usize];
+            e.prev = NIL;
+            e.next = old;
+        }
+        match old {
+            NIL => self.tail = i,
+            h => self.entries[h as usize].prev = i,
+        }
+        self.head = i;
+    }
+
+    /// Drop the least recently seen host and return its now-free slot.
+    fn evict_tail(&mut self) -> u32 {
+        let i = self.tail;
+        debug_assert!(i != NIL, "evict from an empty arena");
+        self.unlink(i);
+        let ip = self.entries[i as usize].ip;
+        self.index.remove(&ip);
+        i
+    }
+}
+
+/// Address with the host bits cleared: /24 for IPv4, /64 for IPv6. The unit
+/// the ASN cache is keyed on and the "same block" grouping in the table.
+fn prefix_base(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
+
+/// "a.b.c.0/24" or "xxxx:xxxx:xxxx:xxxx::/64".
+pub fn prefix_label(ip: IpAddr) -> String {
+    match prefix_base(ip) {
+        b @ IpAddr::V4(_) => format!("{b}/24"),
+        b @ IpAddr::V6(_) => format!("{b}/64"),
+    }
+}
+
+/// Addresses an origin-ASN lookup can say nothing about: private, local,
+/// multicast, the engine's own TUN range, and so on.
+fn is_lookup_worthy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT 100.64/10
+                || (o[0] == 198 && (18..20).contains(&o[1]))) // benchmarking 198.18/15 (our TUN)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80) // link local fe80::/10
+        }
+    }
+}
+
 /// Identifies a flow. `remote`/`local_port` are chosen by direction so the two
 /// directions of one conversation collapse into a single row.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -657,6 +966,8 @@ struct Flow {
     /// Admission-control status, set out-of-band by the connection manager (see
     /// `TrafficMonitor::note_flow`). Packet recording never changes it.
     status: FlowStatus,
+    /// Who opened it — see [`Origin`]. Fixed at creation.
+    origin: Origin,
 }
 
 /// A flow's lifetime totals with wall-clock bounds — the unit the shutdown CSV
@@ -674,13 +985,24 @@ struct FlowRecord {
     first: SystemTime,
     last: SystemTime,
     status: &'static str,
+    /// Peer id at archival time; 0 if the host had already left the arena.
+    peer: u32,
+    asn: Option<u32>,
+    origin: &'static str,
 }
 
 /// Convert a live flow to its archival record. Wall times derive from the
 /// monitor's clock base pair (one wall+mono reading at construction), so the
 /// per-packet hot path never reads the wall clock.
-fn record_of(k: &FlowKey, f: &Flow, wall_base: SystemTime, mono_base: Instant) -> FlowRecord {
+fn record_of(
+    k: &FlowKey,
+    f: &Flow,
+    wall_base: SystemTime,
+    mono_base: Instant,
+    peers: &PeerArena,
+) -> FlowRecord {
     let wall = |t: Instant| wall_base + t.duration_since(mono_base);
+    let peer = peers.get(k.remote_ip);
     FlowRecord {
         remote: fmt_endpoint(k.remote_ip, k.remote_port),
         l4: k.l4,
@@ -692,6 +1014,9 @@ fn record_of(k: &FlowKey, f: &Flow, wall_base: SystemTime, mono_base: Instant) -
         first: wall(f.first_seen),
         last: wall(f.last_seen),
         status: f.status.label(),
+        peer: peer.map_or(0, |p| p.id),
+        asn: peer.and_then(|p| p.asn.as_ref()).map(|a| a.asn),
+        origin: f.origin.label(),
     }
 }
 
@@ -724,11 +1049,18 @@ struct Inner {
     /// the CSV's incompleteness is stated, not silent.
     archive_dropped: u64,
     proto_bytes: HashMap<&'static str, u64>,
-    /// Remote hosts seen speaking uTP or DHT this session. An `Obfuscated` TCP
-    /// flow to one of them is almost certainly an encrypted BitTorrent peer, so
-    /// it is relabelled `ObfuscatedBt`. Bounded: a large swarm is thousands of
-    /// hosts, and past the cap the relabel simply stops learning new ones.
-    bt_hosts: HashSet<IpAddr>,
+    /// What is known about each remote host across its flows — protocol
+    /// families, a stable id, an ASN once looked up. An `Obfuscated` TCP flow
+    /// to a host that also speaks uTP/DHT is almost certainly an encrypted
+    /// BitTorrent peer and is relabelled `ObfuscatedBt`.
+    peers: PeerArena,
+    /// Flows this process is about to open itself (see `mark_own`), waiting for
+    /// their first packet. Consumed on flow creation; stale marks expire.
+    own: HashMap<FlowKey, Instant>,
+    /// Origin-ASN results by prefix (`prefix_base`), negative results included,
+    /// so one lookup covers every host in a block and a block that answers
+    /// nothing is not asked again.
+    asn_cache: HashMap<IpAddr, Option<AsnInfo>>,
     last_tick: Instant,
     /// Clock base pair for converting monotonic stamps to wall time at export.
     wall_base: SystemTime,
@@ -736,7 +1068,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, arena: usize) -> Self {
         Inner {
             total_up: 0,
             total_down: 0,
@@ -750,7 +1082,9 @@ impl Inner {
             archive: VecDeque::new(),
             archive_dropped: 0,
             proto_bytes: HashMap::new(),
-            bt_hosts: HashSet::new(),
+            peers: PeerArena::new(arena),
+            own: HashMap::new(),
+            asn_cache: HashMap::new(),
             last_tick: now,
             wall_base: SystemTime::now(),
             mono_base: now,
@@ -780,10 +1114,25 @@ impl Default for TrafficMonitor {
     }
 }
 
+impl std::fmt::Debug for TrafficMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrafficMonitor")
+    }
+}
+
 impl TrafficMonitor {
     pub fn new() -> Self {
         TrafficMonitor {
-            inner: Mutex::new(Inner::new(Instant::now())),
+            inner: Mutex::new(Inner::new(Instant::now(), PEER_ARENA)),
+            cache: Mutex::new(Arc::new(TrafficSnapshot::default())),
+        }
+    }
+
+    /// A monitor with a small host arena, to exercise eviction in tests.
+    #[cfg(test)]
+    fn with_arena(cap: usize) -> Self {
+        TrafficMonitor {
+            inner: Mutex::new(Inner::new(Instant::now(), cap)),
             cache: Mutex::new(Arc::new(TrafficSnapshot::default())),
         }
     }
@@ -838,13 +1187,10 @@ impl TrafficMonitor {
         let Inner {
             flows,
             proto_bytes,
-            bt_hosts,
+            peers,
+            own,
             ..
         } = &mut *inner;
-
-        if matches!(parsed.app, AppProto::Utp | AppProto::Dht) && bt_hosts.len() < MAX_BT_HOSTS {
-            bt_hosts.insert(remote_ip);
-        }
 
         // Bound live per-flow tracking against unbounded flow creation (the same
         // adversarial input conn.rs budgets for). The packet is already in the
@@ -856,17 +1202,31 @@ impl TrafficMonitor {
             return;
         }
 
-        let flow = flows.entry(key).or_insert_with(|| Flow {
-            app: parsed.app,
-            up: 0,
-            down: 0,
-            pkts: 0,
-            first_seen: now,
-            last_seen: now,
-            last_total: 0,
-            rate: 0.0,
-            status: FlowStatus::Active,
-        });
+        // The host arena is touched only when a flow opens or changes identity,
+        // never per packet; `tick` refreshes recency for everything still live.
+        let flow = match flows.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                peers.touch(remote_ip, parsed.app.family(), now);
+                let origin = if own.remove(v.key()).is_some() {
+                    Origin::Intel
+                } else {
+                    Origin::Host
+                };
+                v.insert(Flow {
+                    app: parsed.app,
+                    up: 0,
+                    down: 0,
+                    pkts: 0,
+                    first_seen: now,
+                    last_seen: now,
+                    last_total: 0,
+                    rate: 0.0,
+                    status: FlowStatus::Active,
+                    origin,
+                })
+            }
+        };
 
         // Upgrade-only classification: adopt the new label only when it is
         // strictly more confident than what the flow already carries, and
@@ -874,10 +1234,11 @@ impl TrafficMonitor {
         // totals track the flow's final identity, not its first packet.
         if parsed.app.rank() > flow.app.rank() {
             relabel(flow, proto_bytes, parsed.app);
+            peers.touch(remote_ip, parsed.app.family(), now);
         }
         // Host already known to torrent: relabel on the spot. The other order
         // (this flow first, the host's uTP later) is caught by `tick`.
-        if flow.app == AppProto::Obfuscated && bt_hosts.contains(&remote_ip) {
+        if flow.app == AppProto::Obfuscated && peers.is_torrenting(remote_ip) {
             relabel(flow, proto_bytes, AppProto::ObfuscatedBt);
         }
         *proto_bytes.entry(flow.app.label()).or_insert(0) += len;
@@ -921,7 +1282,7 @@ impl TrafficMonitor {
             .collect();
         for k in idle {
             if let Some(f) = inner.flows.remove(&k) {
-                let rec = record_of(&k, &f, inner.wall_base, inner.mono_base);
+                let rec = record_of(&k, &f, inner.wall_base, inner.mono_base, &inner.peers);
                 if inner.archive.len() >= MAX_ARCHIVE {
                     inner.archive.pop_front();
                     inner.archive_dropped += 1;
@@ -929,18 +1290,22 @@ impl TrafficMonitor {
                 inner.archive.push_back(rec);
             }
         }
+        inner.own.retain(|_, t| now.duration_since(*t) < OWN_MARK_TTL);
         let Inner {
             flows,
             proto_bytes,
-            bt_hosts,
+            peers,
             ..
         } = &mut *inner;
         for (k, f) in flows.iter_mut() {
             let total = f.up + f.down;
             f.rate = (total.saturating_sub(f.last_total)) as f64 / dt;
             f.last_total = total;
+            // Recency for the host arena: once a second per live flow, rather
+            // than once per packet.
+            peers.refresh(k.remote_ip, f.app.family(), now);
             // Obfuscated flows that predate the host's first uTP/DHT packet.
-            if f.app == AppProto::Obfuscated && bt_hosts.contains(&k.remote_ip) {
+            if f.app == AppProto::Obfuscated && peers.is_torrenting(k.remote_ip) {
                 relabel(f, proto_bytes, AppProto::ObfuscatedBt);
             }
         }
@@ -973,6 +1338,72 @@ impl TrafficMonitor {
         }
     }
 
+    /// Declare that this process is about to talk from `local_port` to
+    /// `remote` (UDP, or TCP when `tcp`), so the resulting flow is recorded as
+    /// ours (`Origin::Intel`) rather than as host traffic. Call after the
+    /// socket is bound and before its first packet; the mark is consumed by
+    /// that packet, or expires. Marking a flow that is already live works too.
+    pub fn mark_own(&self, remote: SocketAddr, local_port: u16, tcp: bool) {
+        let key = FlowKey {
+            remote_ip: remote.ip(),
+            remote_port: remote.port(),
+            local_port,
+            l4: if tcp { "TCP" } else { "UDP" },
+        };
+        let mut inner = self.inner();
+        match inner.flows.get_mut(&key) {
+            Some(f) => f.origin = Origin::Intel,
+            None => {
+                inner.own.insert(key, Instant::now());
+            }
+        }
+    }
+
+    /// The most recently seen host that still needs an origin-ASN lookup, or
+    /// `None`. Hosts whose block is already in the cache are filled from it
+    /// here and skipped, so the caller only ever pays for a new prefix.
+    pub fn enrich_candidate(&self) -> Option<IpAddr> {
+        let mut inner = self.inner();
+        let Inner {
+            peers, asn_cache, ..
+        } = &mut *inner;
+        let mut cached: Vec<(IpAddr, Option<AsnInfo>)> = Vec::new();
+        let mut found = None;
+        for e in peers.iter_mru() {
+            if e.asn.is_some() || !is_lookup_worthy(e.ip) {
+                continue;
+            }
+            match asn_cache.get(&prefix_base(e.ip)) {
+                // Negative answers are cached too: a host whose block has no
+                // origin record is not a candidate, it is simply unknown.
+                Some(info) => cached.push((e.ip, info.clone())),
+                None => {
+                    found = Some(e.ip);
+                    break;
+                }
+            }
+        }
+        for (ip, info) in cached {
+            if let (Some(info), Some(e)) = (info, peers.get_mut(ip)) {
+                e.asn = Some(info);
+            }
+        }
+        found
+    }
+
+    /// Store a lookup result for `ip` and its whole block. `None` records
+    /// that the block answers nothing, so it is not asked again.
+    pub fn enrich(&self, ip: IpAddr, info: Option<AsnInfo>) {
+        let mut inner = self.inner();
+        if inner.asn_cache.len() >= ASN_CACHE_MAX {
+            inner.asn_cache.clear();
+        }
+        inner.asn_cache.insert(prefix_base(ip), info.clone());
+        if let (Some(info), Some(e)) = (info, inner.peers.get_mut(ip)) {
+            e.asn = Some(info);
+        }
+    }
+
     /// Write every flow of the session — archived AND still-live — as CSV to
     /// `path`, ordered by first-seen. Returns the number of rows. Called on
     /// shutdown.
@@ -987,15 +1418,16 @@ impl TrafficMonitor {
         }
         let mut records: Vec<FlowRecord> = inner.archive.iter().cloned().collect();
         for (k, f) in &inner.flows {
-            records.push(record_of(k, f, inner.wall_base, inner.mono_base));
+            records.push(record_of(k, f, inner.wall_base, inner.mono_base, &inner.peers));
         }
         records.sort_by_key(|r| r.first);
 
         let mut out = String::with_capacity(80 + records.len() * 96);
-        // `status` is appended last so existing name-based readers (e.g.
-        // visualize_flows.py) are unaffected; it is empty for ordinary flows.
+        // New columns are appended so existing name-based readers (e.g.
+        // visualize_flows.py) are unaffected. `status` and `origin` are empty
+        // for ordinary flows; `peer` is 0 when the host had left the arena.
         out.push_str(
-            "first_seen,last_seen,remote,l4,app,local_port,up_bytes,down_bytes,packets,status\n",
+            "first_seen,last_seen,remote,l4,app,local_port,up_bytes,down_bytes,packets,status,peer,asn,origin\n",
         );
         let fmt = |t: SystemTime| {
             chrono::DateTime::<chrono::Local>::from(t)
@@ -1004,7 +1436,7 @@ impl TrafficMonitor {
         };
         for r in &records {
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 fmt(r.first),
                 fmt(r.last),
                 r.remote,
@@ -1015,6 +1447,9 @@ impl TrafficMonitor {
                 r.down,
                 r.pkts,
                 r.status,
+                r.peer,
+                r.asn.map(|a| a.to_string()).unwrap_or_default(),
+                r.origin,
             ));
         }
         std::fs::write(path, out)?;
@@ -1050,6 +1485,9 @@ fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
         let idle_ms = now.duration_since(f.last_seen).as_millis() as u64;
         let bytes = f.up + f.down;
         let app = f.app.label();
+        let peer = inner.peers.get(k.remote_ip);
+        let peer_id = peer.map_or(0, |p| p.id);
+        let asn = peer.and_then(|p| p.asn.as_ref());
 
         flows.push(FlowRow {
             remote: fmt_endpoint(k.remote_ip, k.remote_port),
@@ -1060,6 +1498,12 @@ fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
             rate: f.rate,
             idle_ms,
             status: f.status.label(),
+            peer: peer_id,
+            local_port: k.local_port,
+            prefix: prefix_label(k.remote_ip),
+            asn: asn.map(|a| a.asn),
+            org: asn.map(|a| a.org.clone()).unwrap_or_default(),
+            origin: f.origin.label(),
         });
 
         match k.l4 {
@@ -1075,6 +1519,8 @@ fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
         // mostly does, not by whichever flow hashed first.
         let h = hosts.entry(k.remote_ip).or_insert_with(|| HostAcc {
             idle_ms: u64::MAX,
+            peer: peer_id,
+            asn: asn.map(|a| a.asn),
             ..HostAcc::default()
         });
         h.flows += 1;
@@ -1111,6 +1557,8 @@ fn build_snapshot(inner: &Inner, now: Instant) -> TrafficSnapshot {
             down: a.down,
             rate: a.rate,
             idle_ms: if a.idle_ms == u64::MAX { 0 } else { a.idle_ms },
+            peer: a.peer,
+            asn: a.asn,
         })
         .collect();
     hosts.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)));
@@ -1175,6 +1623,8 @@ struct HostAcc {
     rate: f64,
     idle_ms: u64,
     top_bytes: u64,
+    peer: u32,
+    asn: Option<u32>,
 }
 
 /// Accumulator for the per-service rollup. Not part of the published view.
@@ -1284,6 +1734,16 @@ pub struct FlowRow {
     pub idle_ms: u64,
     /// Engine admission status: "" (active), "shed", or "reaped".
     pub status: &'static str,
+    /// Session-stable id of the remote host ("p17"); 0 if it left the arena.
+    pub peer: u32,
+    pub local_port: u16,
+    /// The remote host's /24 (v6: /64), e.g. "104.16.123.0/24".
+    pub prefix: String,
+    pub asn: Option<u32>,
+    /// AS name when known, else empty.
+    pub org: String,
+    /// "" for host traffic, "intel" for this process's own lookups.
+    pub origin: &'static str,
 }
 
 /// One unique remote host, with every flow to it collapsed into one row.
@@ -1298,6 +1758,9 @@ pub struct HostRow {
     pub rate: f64,
     /// Idle time of the host's freshest flow.
     pub idle_ms: u64,
+    /// Session-stable id of the host; 0 if it left the arena.
+    pub peer: u32,
+    pub asn: Option<u32>,
 }
 
 /// One remote service port, with every flow to it collapsed into one row.
@@ -1569,6 +2032,179 @@ mod tests {
         m.record(Direction::Up, &o);
         m.tick();
         assert_eq!(label(&m.snapshot(), "9.9.9.9"), "Obfuscated (uTP/DHT)");
+    }
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, n))
+    }
+
+    #[test]
+    fn peer_arena_evicts_lru_and_keeps_learning() {
+        let now = Instant::now();
+        let mut a = PeerArena::new(4);
+        for n in 1..=4 {
+            assert_eq!(a.touch(ip(n), family::TLS, now), n as u32);
+        }
+        // Touching 1 makes it the most recent; 2 is now the oldest.
+        a.touch(ip(1), family::DHT, now);
+        a.touch(ip(5), family::UTP, now);
+        assert_eq!(a.len(), 4);
+        assert!(a.get(ip(2)).is_none(), "least recently seen host evicted");
+        assert_eq!(a.get(ip(1)).unwrap().id, 1);
+        assert_eq!(a.get(ip(1)).unwrap().families, family::TLS | family::DHT);
+        assert!(a.is_torrenting(ip(1)));
+        assert!(!a.is_torrenting(ip(3)));
+        assert_eq!(a.get(ip(5)).unwrap().id, 5);
+        // Learning continues past capacity: one in, one out, every time.
+        a.touch(ip(6), family::UTP, now);
+        assert!(a.get(ip(3)).is_none());
+        assert_eq!(a.len(), 4);
+        let order: Vec<u32> = a.iter_mru().map(|e| e.id).collect();
+        assert_eq!(order, [6, 5, 1, 4]);
+    }
+
+    #[test]
+    fn peer_ids_are_stable_and_never_reused() {
+        let now = Instant::now();
+        let mut a = PeerArena::new(2);
+        a.touch(ip(1), 0, now);
+        a.touch(ip(2), 0, now);
+        a.touch(ip(3), 0, now); // evicts 1
+        assert!(a.get(ip(1)).is_none());
+        // Back again: a new identity, not the recycled slot's old number.
+        assert_eq!(a.touch(ip(1), 0, now), 4);
+        assert_eq!(a.touch(ip(1), 0, now), 4);
+        assert_eq!(a.touch(ip(3), 0, now), 3);
+    }
+
+    #[test]
+    fn relabel_keeps_working_past_arena_capacity() {
+        // Three slots, seven hosts: the arena is overflowing well before the
+        // host under test shows up.
+        let m = TrafficMonitor::with_arena(3);
+        for n in 1..=6u8 {
+            let u = v4_udp([10, 0, 0, 2], [203, 0, 113, n], 51413, 6881, &utp(4));
+            m.record(Direction::Up, &u);
+        }
+        // A fresh host after all that: still learned, still relabelled.
+        let cipher = pseudo_random(300, 5);
+        let u = v4_udp([10, 0, 0, 2], [203, 0, 113, 9], 51413, 6881, &utp(4));
+        m.record(Direction::Up, &u);
+        let t = v4_tcp([10, 0, 0, 2], [203, 0, 113, 9], 40001, 6881, &cipher);
+        m.record(Direction::Up, &t);
+        m.tick();
+        let snap = m.snapshot();
+        let row = snap.flows.iter().find(|f| f.proto == "TCP").unwrap();
+        assert_eq!(row.app, "Obfuscated (uTP/DHT)");
+        assert_eq!(row.peer, 7);
+        // The evicted early hosts report no peer id rather than a stale one.
+        let early = snap.flows.iter().find(|f| f.remote.starts_with("203.0.113.1:")).unwrap();
+        assert_eq!(early.peer, 0);
+    }
+
+    #[test]
+    fn own_dns_flows_are_marked_intel() {
+        let m = TrafficMonitor::new();
+        let server: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        m.mark_own(server, 40001, false);
+        // A DNS-shaped query from the marked port, and an unrelated one.
+        let q = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, b'w', b'w', b'w', 0, 0, 1, 0, 1];
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [1, 1, 1, 1], 40001, 53, &q));
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [1, 1, 1, 1], 40002, 53, &q));
+        m.tick();
+        let snap = m.snapshot();
+        let ours = snap.flows.iter().find(|f| f.local_port == 40001).unwrap();
+        let host = snap.flows.iter().find(|f| f.local_port == 40002).unwrap();
+        assert_eq!((ours.app, ours.origin), ("DNS", "intel"));
+        assert_eq!((host.app, host.origin), ("DNS", ""));
+        // Admission control owns `status`, not `origin`: noting the flow as
+        // admitted must not erase the mark.
+        m.note_flow(false, "1.1.1.1:53".parse().unwrap(), 40001, FlowStatus::Active);
+        m.tick();
+        assert_eq!(m.snapshot().flows.iter().find(|f| f.local_port == 40001).unwrap().origin, "intel");
+        // Marking a flow that is already live works too.
+        m.mark_own(server, 40002, false);
+        m.tick();
+        assert_eq!(m.snapshot().flows.iter().find(|f| f.local_port == 40002).unwrap().origin, "intel");
+    }
+
+    #[test]
+    fn snapshot_carries_peer_prefix_and_asn() {
+        let m = TrafficMonitor::new();
+        let a = v4_tcp([10, 0, 0, 2], [104, 16, 123, 96], 40001, 443, &pseudo_random(300, 1));
+        let b = v4_tcp([10, 0, 0, 2], [104, 16, 123, 97], 40002, 443, &pseudo_random(300, 2));
+        let lan = v4_tcp([10, 0, 0, 2], [192, 168, 1, 1], 40003, 80, b"GET / HTTP/1.1");
+        m.record(Direction::Up, &a);
+        m.record(Direction::Up, &b);
+        m.record(Direction::Up, &lan);
+        m.tick();
+        let snap = m.snapshot();
+        let ra = snap.flows.iter().find(|f| f.local_port == 40001).unwrap();
+        assert_eq!(ra.peer, 1);
+        assert_eq!(ra.prefix, "104.16.123.0/24");
+        assert_eq!(ra.asn, None);
+        assert_eq!(snap.hosts.iter().find(|h| h.ip == "104.16.123.96").unwrap().peer, 1);
+
+        // Private hosts are never candidates; the most recent public one is.
+        let cand = m.enrich_candidate();
+        assert!(cand == Some(ra_ip(96)) || cand == Some(ra_ip(97)));
+        m.enrich(
+            cand.unwrap(),
+            Some(AsnInfo { asn: 13335, prefix: "104.16.0.0/13".into(), org: "CLOUDFLARENET".into() }),
+        );
+        // The other host in the same /24 is served from the cache and no
+        // further candidate remains.
+        assert_eq!(m.enrich_candidate(), None);
+        m.tick();
+        let snap = m.snapshot();
+        for port in [40001, 40002] {
+            let f = snap.flows.iter().find(|f| f.local_port == port).unwrap();
+            assert_eq!((f.asn, f.org.as_str()), (Some(13335), "CLOUDFLARENET"), "port {port}");
+        }
+        assert_eq!(snap.flows.iter().find(|f| f.local_port == 40003).unwrap().asn, None);
+        assert_eq!(snap.hosts.iter().find(|h| h.ip == "104.16.123.97").unwrap().asn, Some(13335));
+
+        // A negative answer is remembered for the block too.
+        m.record(Direction::Up, &v4_tcp([10, 0, 0, 2], [198, 51, 100, 7], 40004, 443, &pseudo_random(300, 3)));
+        assert_eq!(m.enrich_candidate(), Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))));
+        m.enrich(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), None);
+        m.record(Direction::Up, &v4_tcp([10, 0, 0, 2], [198, 51, 100, 8], 40005, 443, &pseudo_random(300, 4)));
+        assert_eq!(m.enrich_candidate(), None);
+    }
+
+    fn ra_ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(104, 16, 123, last))
+    }
+
+    #[test]
+    fn prefix_labels_cover_both_families() {
+        assert_eq!(prefix_label("104.16.123.96".parse().unwrap()), "104.16.123.0/24");
+        assert_eq!(prefix_label("2606:4700::6810:7c60".parse().unwrap()), "2606:4700::/64");
+        assert!(is_lookup_worthy("8.8.8.8".parse().unwrap()));
+        for private in ["10.1.2.3", "100.64.0.1", "198.18.0.1", "127.0.0.1", "224.0.0.251", "fe80::1", "fd00::1"] {
+            assert!(!is_lookup_worthy(private.parse().unwrap()), "{private}");
+        }
+    }
+
+    #[test]
+    fn csv_appends_peer_asn_origin() {
+        let m = TrafficMonitor::new();
+        let server: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        m.mark_own(server, 40001, false);
+        let q = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1];
+        m.record(Direction::Up, &v4_udp([10, 0, 0, 2], [1, 1, 1, 1], 40001, 53, &q));
+        m.enrich(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            Some(AsnInfo { asn: 13335, prefix: "1.1.1.0/24".into(), org: "CLOUDFLARENET".into() }),
+        );
+        let path = std::env::temp_dir().join(format!("tunnel-csv-test-{}.csv", std::process::id()));
+        assert_eq!(m.write_csv(&path).unwrap(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut lines = text.lines();
+        assert!(lines.next().unwrap().ends_with(",packets,status,peer,asn,origin"));
+        let row = lines.next().unwrap();
+        assert!(row.ends_with(",,1,13335,intel"), "{row}");
     }
 
     #[test]

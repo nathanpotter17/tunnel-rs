@@ -29,6 +29,8 @@ mod wg;
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod enrich;
 
 use settings::Settings;
 use state::Shared;
@@ -279,6 +281,7 @@ async fn main() -> Result<()> {
                 tracing::error!("engine: {e:#}");
             }
         });
+        let enricher = enrich::spawn(shared.clone());
         let gui_result =
             gui::TunnelApp::run(shared.clone()).map_err(|e| anyhow::anyhow!("dashboard: {e}"));
 
@@ -291,6 +294,11 @@ async fn main() -> Result<()> {
         shared.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = engine.await {
             tracing::error!("engine task join: {e}");
+        }
+        // Exits within one poll interval of the shutdown flag; a lookup in
+        // flight is bounded by its own timeout.
+        if enricher.join().is_err() {
+            tracing::error!("enricher thread panicked");
         }
         gui_result
     }
